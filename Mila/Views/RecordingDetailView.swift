@@ -1,0 +1,1740 @@
+import SwiftUI
+import AVKit
+import AppKit
+import TranscriptionCore
+import UniformTypeIdentifiers
+import MilaKit
+
+struct RecordingDetailView: View {
+    let recording: Recording
+    @EnvironmentObject private var store: RecordingStore
+    @EnvironmentObject private var transcription: TranscriptionService
+    @EnvironmentObject private var modelManager: ModelManager
+    @EnvironmentObject private var llmSettings: LLMSettings
+    @EnvironmentObject private var summarizer: RecordingSummarizer
+    @EnvironmentObject private var liveAI: LiveAISettings
+    @EnvironmentObject private var speakerProfileStore: SpeakerProfileStore
+    @EnvironmentObject private var voiceRecognition: VoiceRecognitionSettings
+    /// Accepting a suggested speaker name routes it through the directory,
+    /// exactly as the rename popover does (issue #348).
+    @EnvironmentObject private var speakerDirectory: SpeakerDirectory
+
+    /// Non-nil while the `.milashare` export sheet is up (see
+    /// `recordingShareSheet`).
+    @State private var shareSelection: SharedSpeakersExportSelection?
+
+    @State private var player: AVPlayer?
+    @State private var currentTime: Double = 0
+    @State private var timeObserver: Any?
+    /// Persisted so a chosen speed carries across recordings and app launches
+    /// (the menu in `playbackBar`). Stored as a plain `Double`; the menu reads
+    /// it back through `PlaybackSpeed.nearest(to:)`, which snaps anything that
+    /// isn't a supported rate.
+    @AppStorage("detail.playback.speed") private var playbackSpeed: Double = 1.0
+    /// Whether the transcript auto-scrolls to keep the highlighted segment in
+    /// view. Deliberately NOT persisted: ContentView applies `.id(rec.id)`, so
+    /// every recording opens following, and a manual scroll only disengages it
+    /// for that visit.
+    @State private var isFollowing = true
+    /// Reference type on purpose. The scroll probe and the active-row preference
+    /// both write here on every scrolled frame; holding this in `@State` would
+    /// re-lay out the whole transcript each time.
+    @State private var follow = FollowCoordinator()
+    @State private var isEditingTitle = false
+    @State private var titleDraft = ""
+    /// Set when the user picks a merge target in the speaker popover; drives
+    /// the confirmation alert, which is what actually performs the merge.
+    @State private var pendingMerge: PendingSpeakerMerge?
+    /// Transcript lines picked with click / shift-click / command-click, the
+    /// targets of "Delete Segments" and ⌘⌫ (#357).
+    @State private var selection = TranscriptSelection()
+    /// A trim the user asked for and has not yet confirmed. Like a merge,
+    /// it is destructive and has no undo, so it is always confirmed.
+    @State private var pendingTrim: PendingTranscriptEdit?
+
+    @FocusState private var titleFieldFocused: Bool
+
+    /// Every raw speaker id the transcript uses, in first-appearance order.
+    private var distinctSpeakerIDs: [String] {
+        var seen = Set<String>()
+        return recording.segments.compactMap(\.speaker).filter { seen.insert($0).inserted }
+    }
+
+    /// How many lines each raw speaker id carries. Drives whether "Split this
+    /// line" is offered at all: `RecordingStore.splitSegmentSpeaker` no-ops on
+    /// a speaker's only line (splitting it would just rename the id and
+    /// strand the old one), so offering it there is an enabled menu item that
+    /// does nothing.
+    private var lineCountsBySpeaker: [String: Int] {
+        recording.segments.reduce(into: [:]) { counts, seg in
+            guard let raw = seg.speaker else { return }
+            counts[raw, default: 0] += 1
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            AIOverviewBanner(
+                summary: recording.summary,
+                items: recording.actionItems ?? [],
+                recordingLanguage: recording.language,
+                isSummarizing: summarizer.isSummarizing(recording.id),
+                onRegenerateSummary: canRegenerateSummary
+                    ? { summarizer.regenerate(recording) }
+                    : nil,
+                summaryLanguage: recording.summaryLanguageOverride,
+                globalOutputLanguage: liveAI.outputLanguage,
+                onSetSummaryLanguage: canRegenerateSummary
+                    ? { summarizer.setSummaryLanguage($0, for: recording.id) }
+                    : nil,
+                isTranscribing: isTranscriptionBusy
+            )
+            SpeakerNameSuggestionsBanner(
+                suggestions: recording.actionableSpeakerNameSuggestions,
+                language: recording.transcriptLanguage,
+                onAccept: { suggestion in
+                    // The normal rename path: directory first (canonical
+                    // spelling, future pick-lists), then `setSpeakerName`.
+                    _ = store.acceptSpeakerNameSuggestion(forSpeaker: suggestion.speaker,
+                                                          recordingID: recording.id,
+                                                          canonicalName: { speakerDirectory.add($0) })
+                },
+                onDismiss: { suggestion in
+                    store.dismissSpeakerNameSuggestion(forSpeaker: suggestion.speaker,
+                                                       recordingID: recording.id)
+                }
+            )
+            transcriptArea
+                // Force the transcript area to take the remaining
+                // vertical space and scroll its OWN content rather than
+                // expanding to the segments' intrinsic height. Without
+                // this, a transcript with many segments made the VStack
+                // grow to ~1500 px in a 700 px window and the content
+                // overflowed upward past the title bar, leaving the
+                // user with a blank window. Reproduced via accessibility
+                // tree inspection.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Divider()
+            playbackBar
+        }
+        // ContentView applies .id(rec.id) at the call site, so navigating
+        // between recordings rebuilds this view and `onAppear` configures
+        // the player for the new one.
+        .onAppear { configurePlayer() }
+        .onDisappear { teardownPlayer() }
+        // A `.milashare` import that replaces THIS recording keeps its id —
+        // so nothing above rebuilds — but swaps the audio file and deletes
+        // the old one. Re-point the player or it keeps playing a file that
+        // is gone.
+        .onChange(of: recording.audioFileName) { _, _ in configurePlayer() }
+        // "End Conversation Here" swaps in a shorter audio file under the SAME
+        // name, and the player still holds the old one open. The store bumps
+        // an explicit per-recording revision for exactly that swap — not
+        // `duration`, which a transcription pass also changes — so re-point
+        // the player at the trimmed file only then.
+        .onChange(of: store.audioRevisions[recording.id] ?? 0) { _, _ in
+            configurePlayer()
+            currentTime = 0
+        }
+        // Drop selected ids that no longer name a line: after a delete
+        // (count changes) or a re-transcription (new ids; status settles).
+        .onChange(of: recording.segments.count) { _, _ in pruneSelection() }
+        .onChange(of: recording.status) { _, _ in pruneSelection() }
+        .recordingShareSheet(selection: $shareSelection, recording: recording, store: store)
+        .onChange(of: playbackSpeed) { _, newValue in
+            let rate = Float(PlaybackSpeed.nearest(to: newValue).rawValue)
+            player?.defaultRate = rate
+            // Only touch `rate` while playback is actually running: assigning a
+            // non-zero rate to a paused player STARTS it, so without this guard
+            // picking a speed from the menu would begin playing on its own.
+            if player?.timeControlStatus == .playing {
+                player?.rate = rate
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 4) {
+                titleEditor
+                HStack(spacing: 8) {
+                    HStack(spacing: 6) {
+                        RecordingSourceBadge(recording: recording, size: 18)
+                        Text(recording.detectedMeetingApp?.info.displayName
+                             ?? recording.source.displayName)
+                    }
+                    Text("·")
+                    Text(recording.createdAt, format: .dateTime)
+                    Text("·")
+                    Text(formatDuration(recording.duration))
+                    Text("·")
+                    RecordingFolderMenu(recordingID: recording.id,
+                                        currentFolder: recording.folder)
+                    if let sharedBy = recording.sharedBy {
+                        Text("·")
+                        Label("Shared by \(sharedBy)", systemImage: "person.crop.circle.badge.checkmark")
+                            .help(recording.sharedAt.map {
+                                "Shared \($0.formatted(date: .abbreviated, time: .shortened))"
+                            } ?? "Shared recording")
+                            .accessibilityIdentifier("detail.sharedBy")
+                    }
+                }
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            }
+            Spacer()
+            actionButtons
+        }
+        .padding()
+    }
+
+    /// Click-to-edit title. Pressing Return or losing focus commits the new
+    /// title via `store.rename`. Escape reverts without saving. The display
+    /// state intentionally does not look like a TextField until the user
+    /// clicks it — we don't want a 20pt input bar dominating the header.
+    @ViewBuilder
+    private var titleEditor: some View {
+        if isEditingTitle {
+            TextField("Title", text: $titleDraft)
+                .font(.title2.weight(.semibold))
+                .textFieldStyle(.roundedBorder)
+                .focused($titleFieldFocused)
+                .onSubmit { commitTitle() }
+                .onExitCommand { cancelTitleEdit() }
+                .onChange(of: titleFieldFocused) { _, focused in
+                    if !focused { commitTitle() }
+                }
+                .accessibilityIdentifier("detail.title.field")
+        } else {
+            Text(recording.title)
+                .font(.title2.weight(.semibold))
+                .contentShape(Rectangle())
+                .onTapGesture { beginTitleEdit() }
+                .help("Click to rename")
+                .accessibilityIdentifier("detail.title.label")
+        }
+    }
+
+    private func beginTitleEdit() {
+        titleDraft = recording.title
+        isEditingTitle = true
+        // Defer focus to next runloop tick so the TextField is actually in
+        // the view hierarchy before we ask it to grab keyboard focus.
+        DispatchQueue.main.async { titleFieldFocused = true }
+    }
+
+    private func commitTitle() {
+        guard isEditingTitle else { return }
+        let trimmed = titleDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, trimmed != recording.title {
+            store.rename(recording, to: trimmed)
+        }
+        isEditingTitle = false
+    }
+
+    private func cancelTitleEdit() {
+        isEditingTitle = false
+        titleDraft = recording.title
+    }
+
+    private var actionButtons: some View {
+        let currentLang = RecordingLanguage.fromCode(recording.language)
+        let busy = isTranscriptionBusy
+        // Icon-only buttons with hover tooltips. Labeled buttons here
+        // competed with the title for header width and truncated ("Copy
+        // tra…"); icons keep all four actions visible at any window size.
+        // The Re-transcribe MENU keeps its full text labels in the dropdown.
+        return HStack(spacing: 10) {
+            Menu {
+                Button {
+                    // Route through the live-store chokepoint (same as the
+                    // language-switch action) so status + audioFileName handling
+                    // stays consistent and we never enqueue a stale snapshot
+                    // whose `.wav` a since-run compression already deleted.
+                    guard let prepared = store.prepareForRetranscription(id: recording.id) else { return }
+                    transcription.enqueue(prepared, isRetranscription: true)
+                } label: {
+                    Label("\(currentLang.flagEmoji) \(currentLang.displayName) (current)",
+                          systemImage: "arrow.clockwise")
+                }
+                Button {
+                    retranscribe(in: currentLang.other)
+                } label: {
+                    Label("\(currentLang.other.flagEmoji) \(currentLang.other.displayName)",
+                          systemImage: "arrow.triangle.2.circlepath")
+                }
+            } label: {
+                Image(systemName: "text.badge.checkmark")
+            }
+            .fixedSize()
+            .disabled(busy)
+            .help(recording.status == .completed ? "Re-transcribe" : "Transcribe")
+
+            Menu {
+                Button {
+                    shareForMila()
+                } label: {
+                    Label("Share for Mila…", systemImage: "square.and.arrow.up.on.square")
+                }
+                .disabled(!RecordingShareExporter.canExport(recording))
+                ShareLink(item: store.audioURL(for: recording)) {
+                    Label("Share Audio…", systemImage: "waveform")
+                }
+            } label: {
+                Image(systemName: "square.and.arrow.up")
+            }
+            .fixedSize()
+            .help("Share this recording with another Mila user, or share just the audio")
+
+            Button {
+                copyOverview()
+            } label: {
+                Image(systemName: "doc.on.doc")
+            }
+            .disabled(!hasOverviewToCopy)
+            .help("Copy summary + action items")
+
+            Button {
+                exportSRT()
+            } label: {
+                Image(systemName: "captions.bubble")
+            }
+            .disabled(recording.segments.isEmpty)
+            .help("Export subtitles (.srt) for the original video/audio")
+        }
+    }
+
+    /// Produce a `.milashare` for a colleague — the voice-profile opt-in
+    /// sheet first when there is something to offer, else the save panel.
+    private func shareForMila() {
+        if let selection = RecordingShareExporter.exportSelection(
+            for: recording, profiles: speakerProfileStore, voiceRecognition: voiceRecognition) {
+            shareSelection = selection
+        } else {
+            let recording = recording
+            Task { @MainActor in
+                await RecordingShareExporter.saveInteractively(recording, store: store, profiles: [])
+            }
+        }
+    }
+
+    /// Save the SRT file to a user-chosen location. Defaulting the filename
+    /// to the recording title makes the common case (drag video in → save
+    /// `MyVideo.srt` next to `MyVideo.mp4`) one click.
+    private func exportSRT() {
+        let panel = NSSavePanel()
+        panel.title = "Export Subtitles"
+        panel.allowedContentTypes = [.init(filenameExtension: "srt") ?? .data]
+        panel.nameFieldStringValue = recording.title + ".srt"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try TranscriptExporter.writeSRT(for: recording, to: url)
+        } catch {
+            NSAlert(error: error).runModal()
+        }
+    }
+
+    /// Re-run the transcription pipeline with a different language model.
+    /// Updates the persisted `Recording.language` so the downstream
+    /// `TranscriptionService` picks the right model on its own.
+    private func retranscribe(in language: RecordingLanguage) {
+        // Mutate only language+status on the LIVE record so we don't clobber a
+        // since-compressed `.m4a` audioFileName back to a deleted `.wav`.
+        guard let prepared = store.prepareForRetranscription(id: recording.id,
+                                                             language: language.rawValue)
+        else { return }
+        transcription.enqueue(prepared, isRetranscription: true)
+    }
+
+    /// Whether the user can ask for a fresh summary right now. Gates the
+    /// "Regenerate summary" context-menu entry in `AIOverviewBanner` so
+    /// it never shows up for recordings without an LLM CLI configured
+    /// or without anything to summarise. Mirrors `RecordingSummarizer`'s
+    /// own predicate but adds the "force-allowed even if a summary
+    /// exists" piece — that's the whole point of the affordance.
+    private var canRegenerateSummary: Bool {
+        guard llmSettings.isConfigured else { return false }
+        return !recording.fullText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+    }
+
+    /// Queued for or inside a transcription pass. One predicate for the
+    /// header's Re-transcribe menu and the AI overview's regenerate /
+    /// summary-language entries, so the two cannot disagree about whether
+    /// the transcript is about to change under a summary call.
+    private var isTranscriptionBusy: Bool {
+        transcription.activeRecordingID == recording.id
+            || transcription.pendingIDs.contains(recording.id)
+            // An "End Conversation Here" audio cut is still running: a
+            // re-transcription now would read the full audio and write the
+            // removed lines back (#357). The store refuses it as well.
+            || store.audioTrimPendingIDs.contains(recording.id)
+    }
+
+    /// Human-readable name of the whisper model that will run for the
+    /// recording's CURRENT language. Prefers `recording.modelName` once
+    /// transcription has started writing it back to the store (that's
+    /// what the engine actually used), otherwise falls back to the
+    /// model selected for the recording's language.
+    private var activeTranscriptionModelName: String {
+        if let name = recording.modelName, !name.isEmpty { return name }
+        if let model = modelManager.model(for: recording.language) {
+            return model.displayName
+        }
+        return modelManager.selectedModel()?.displayName ?? ""
+    }
+
+    /// What the transcript area shows while a recording has no segments.
+    /// `nil` means no placeholder — the active-transcription progress view
+    /// owns that state.
+    enum EmptyTranscriptPlaceholder: Equatable {
+        /// Queued behind the active transcription — the Transcribe menu is
+        /// disabled (see `busy` in `actionButtons`), so pointing the user
+        /// at it would be a dead end.
+        case waitingInQueue
+        /// Idle: invite the user to start a transcription themselves.
+        case clickTranscribe
+        /// Idle because the user stopped the transcription to run it later
+        /// (`Recording.transcriptionDeferredAt`). Same Transcribe invitation,
+        /// but it has to say "stopped": the row is stored as `.failed`, and
+        /// "No transcript yet" would leave the user wondering what happened.
+        case stopped
+    }
+
+    /// Decision for the empty-segments placeholder, split out as a pure
+    /// function so RecordingDetailPlaceholderTests can pin the queued
+    /// case without building the view.
+    static func emptyTranscriptPlaceholder(isActive: Bool,
+                                           isQueued: Bool,
+                                           isDeferred: Bool = false) -> EmptyTranscriptPlaceholder? {
+        if isActive { return nil }
+        if isQueued { return .waitingInQueue }
+        return isDeferred ? .stopped : .clickTranscribe
+    }
+
+    /// "Stop Transcribing" — take the run off the CPU now, keep the recording,
+    /// transcribe it later. Shown only while there is a run to stop (active or
+    /// queued); the service decides the rest.
+    private var stopTranscribingButton: some View {
+        Button("Stop Transcribing") {
+            transcription.deferTranscription(of: recording.id)
+        }
+        .help("Stop for now and keep the recording. Click Transcribe whenever you want to run it.")
+        .accessibilityIdentifier("recording.stopTranscribing")
+    }
+
+    /// Says the transcript is knowingly incomplete — some of the recording
+    /// could not be transcribed because the transcription server was
+    /// unreachable (or refused it) during the recording and again when it was
+    /// saved — and offers to transcribe just those parts now (#355).
+    private var missingPartsNote: some View {
+        // `untranscribedSeconds` sums only valid spans, so it is finite; the
+        // clamp keeps `Int(_:)` safe whatever a hand-edited store holds.
+        func clampedSeconds(_ value: Double) -> Int {
+            value.isFinite ? Int(min(max(0, value), 24 * 60 * 60).rounded(.up)) : 0
+        }
+        let retryable = clampedSeconds(recording.retryableUntranscribedSeconds)
+        let unreadable = clampedSeconds(recording.untranscribedSeconds - recording.retryableUntranscribedSeconds)
+        let isRetrying = transcription.spanRetryIDs.contains(recording.id)
+        var message = ""
+        if retryable > 0 {
+            message = "\(formatDuration(Double(retryable))) of this recording isn't in the transcript — the transcription server couldn't be reached or refused it."
+        }
+        if unreadable > 0 {
+            if !message.isEmpty { message += " " }
+            message += "\(formatDuration(Double(unreadable))) of audio couldn't be read back, so it can't be transcribed."
+        }
+        return HStack(spacing: 8) {
+            Label {
+                Text(message)
+            } icon: {
+                Image(systemName: "wifi.exclamationmark")
+                    .foregroundStyle(.orange)
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            if isRetrying {
+                ProgressView().controlSize(.small)
+            } else if retryable > 0 {
+                Button("Retry missing parts") {
+                    let id = recording.id
+                    Task { await transcription.retryUntranscribedSpans(of: id) }
+                }
+                .controlSize(.small)
+                .help("Transcribe just the missing parts of the audio and add them to the transcript in place.")
+                .accessibilityIdentifier("recording.retryMissingParts")
+            }
+        }
+        .accessibilityIdentifier("recording.untranscribedNote")
+    }
+
+    @ViewBuilder
+    private var transcriptArea: some View {
+        // Queued wins over "Stopping…" and over the progress view: a row
+        // re-queued with Transcribe while its previous run is still unwinding
+        // (`TranscriptionService.enqueue`) is waiting for its NEW run, and
+        // that is the run the Stop button here addresses.
+        let queuedAgain = transcription.pendingIDs.contains(recording.id)
+        if transcription.stoppingRecordingID == recording.id, !queuedAgain {
+            // Stop was clicked; the run is unwinding (possibly waiting out a
+            // model load nothing can interrupt). No percentage, no second Stop.
+            VStack(spacing: 12) {
+                Spacer()
+                ProgressView()
+                    .controlSize(.small)
+                Text("Stopping…")
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if transcription.activeRecordingID == recording.id, !queuedAgain {
+            VStack(spacing: 12) {
+                Spacer()
+                ProgressView(value: transcription.progress) {
+                    // Use the model for THIS recording's language, not
+                    // `modelManager.selectedModel()` (the user's
+                    // global default). Otherwise re-transcribing a
+                    // recording in English while the user has Hebrew
+                    // pinned globally still says "Transcribing with
+                    // ivrit-ai…" while actually running OpenAI Turbo,
+                    // which was the bug reported.
+                    Text("Transcribing with \(activeTranscriptionModelName)…")
+                }
+                .progressViewStyle(.linear)
+                .frame(maxWidth: 360)
+                Text("\(Int(transcription.progress * 100))%")
+                    .foregroundStyle(.secondary)
+                stopTranscribingButton
+                    .padding(.top, 4)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if recording.segments.isEmpty {
+            let placeholder = Self.emptyTranscriptPlaceholder(
+                isActive: transcription.activeRecordingID == recording.id && !queuedAgain,
+                isQueued: queuedAgain,
+                isDeferred: recording.isTranscriptionDeferred
+            )
+            if placeholder == .waitingInQueue {
+                ContentUnavailableView {
+                    Label("Waiting in queue", systemImage: "clock")
+                } description: {
+                    Text("Transcription will start when the recording ahead of it finishes.")
+                } actions: {
+                    stopTranscribingButton
+                }
+            } else if placeholder == .stopped {
+                ContentUnavailableView {
+                    Label("Transcription stopped", systemImage: "pause.circle")
+                } description: {
+                    Text("Click \(Image(systemName: "text.badge.checkmark")) Transcribe when you're ready to run it.")
+                }
+            } else {
+                ContentUnavailableView(
+                    "No transcript yet",
+                    systemImage: "text.alignleft",
+                    description: Text("Click \(Image(systemName: "text.badge.checkmark")) Transcribe to start.")
+                )
+            }
+        } else {
+            VStack(spacing: 0) {
+                // Transcript-area copy button, on the right just below the
+                // AI-overview banner's divider. Mirrors the consolidated
+                // copy model: this grabs the transcript; the header button
+                // grabs the summary + action items.
+                HStack {
+                    // A re-transcription (or a live draft's full pass) waiting
+                    // behind another job keeps showing the current text, so
+                    // say it is queued — and let it be stopped from here, as
+                    // the empty-transcript state does.
+                    if transcription.pendingIDs.contains(recording.id) {
+                        Label("Waiting in queue to transcribe", systemImage: "clock")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        stopTranscribingButton
+                            .controlSize(.small)
+                    } else if recording.isTranscriptionDeferred {
+                        // A chunk-mode live draft whose first full pass was
+                        // stopped keeps its text on screen, so without this it
+                        // reads as a finished transcript. Same cue the
+                        // empty-transcript placeholder gives.
+                        Label {
+                            Text("Transcription stopped — click \(Image(systemName: "text.badge.checkmark")) Transcribe to run it.")
+                        } icon: {
+                            Image(systemName: "pause.circle")
+                        }
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("recording.transcriptionStopped")
+                    } else if recording.untranscribedSpans?.isEmpty == false {
+                        missingPartsNote
+                    }
+                    Spacer()
+                    Button {
+                        copyTranscript()
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(recording.fullText.isEmpty)
+                    .help("Copy transcript")
+                }
+                .padding(.horizontal)
+                .padding(.top, 8)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 4) {
+                            // Show the speaker column whenever ANY segment has a
+                            // speaker label — that's how the user knows
+                            // diarization actually ran for this recording.
+                            // Dictation segments have nil speakers, so they
+                            // naturally hide the column; a meeting where
+                            // pyannote found only 1 speaker still shows
+                            // "Speaker A" so the user gets feedback that the
+                            // detection ran (vs. silently failing to detect).
+                            let hasSpeakers = recording.segments.contains { $0.speaker != nil }
+                            // Only color speaker labels once there's more than
+                            // one distinct speaker to tell apart — a single-
+                            // speaker recording keeps the plain tint color.
+                            let hasMultipleSpeakers = recording.segments.hasMultipleSpeakers
+                            // Distinct raw ids in transcript order — the targets
+                            // offered for "move this line" and "merge into".
+                            // Hoisted out of the row so it is computed once, not
+                            // once per segment.
+                            let distinctSpeakers = distinctSpeakerIDs
+                            let lineCounts = lineCountsBySpeaker
+                            // One active id per render drives BOTH the highlight and
+                            // the scroll target, so they can never disagree.
+                            let activeID = activeSegmentID
+                            // Hoisted for the same reason: the row menus below
+                            // are built on every render (≈30 Hz during
+                            // playback), so each one may only do O(1) work.
+                            let rowMenu = RowMenuContext(
+                                canTrim: canEditTranscript,
+                                lastID: recording.segments.last?.id,
+                                lineCount: recording.segments.count,
+                                selectionCount: selection.ids.count)
+                            ForEach(recording.segments) { seg in
+                                SegmentRow(segment: seg,
+                                           isActive: seg.id == activeID,
+                                           isSelected: selection.contains(seg.id),
+                                           showSpeaker: hasSpeakers,
+                                           useSpeakerColor: hasMultipleSpeakers,
+                                           language: recording.transcriptLanguage,
+                                           speakerNames: recording.speakerNames,
+                                           allSpeakers: distinctSpeakers,
+                                           onTap: { rowClicked(seg) },
+                                           onAssignName: { raw, name in
+                                               store.setSpeakerName(name, forSpeaker: raw,
+                                                                    recordingID: recording.id)
+                                           },
+                                           // Only when the speaker has another
+                                           // line to keep — see `lineCountsBySpeaker`.
+                                           onSplit: (seg.speaker.map { lineCounts[$0] ?? 0 } ?? 0) > 1
+                                               ? {
+                                                   store.splitSegmentSpeaker(segmentID: seg.id,
+                                                                             recordingID: recording.id)
+                                               }
+                                               : nil,
+                                           onMoveLine: { target in
+                                               store.reassignSegmentSpeaker(segmentID: seg.id,
+                                                                            toSpeaker: target,
+                                                                            recordingID: recording.id)
+                                           },
+                                           onRequestMerge: { source, target in
+                                               pendingMerge = PendingSpeakerMerge(
+                                                   source: source,
+                                                   target: target,
+                                                   sourceName: source.displaySpeakerName(
+                                                       names: recording.speakerNames,
+                                                       language: recording.transcriptLanguage),
+                                                   targetName: target.displaySpeakerName(
+                                                       names: recording.speakerNames,
+                                                       language: recording.transcriptLanguage))
+                                           })
+                                .background {
+                                    // Only the ACTIVE row publishes its frame: one
+                                    // GeometryReader for the whole transcript rather
+                                    // than one per segment. Used to decide whether a
+                                    // manual scroll ended with the highlight back on
+                                    // screen. A row the LazyVStack has unloaded
+                                    // publishes nothing -- correctly "not visible".
+                                    if seg.id == activeID {
+                                        GeometryReader { geo in
+                                            Color.clear.preference(
+                                                key: ActiveRowFrameKey.self,
+                                                value: geo.frame(in: .named(Self.transcriptSpace)))
+                                        }
+                                    }
+                                }
+                                // Per-line menu (#357). Takes over from the
+                                // transcript-wide menu below when the click
+                                // lands on a line, so it repeats that menu's
+                                // entries too.
+                                .contextMenu {
+                                    segmentContextMenu(for: seg.id, context: rowMenu)
+                                }
+                            }
+                        }
+                        .padding()
+                        .background {
+                            // Must live INSIDE the ScrollView: the probe locates its
+                            // NSScrollView via `enclosingScrollView`, which only
+                            // resolves from a descendant of the clip view.
+                            ScrollActivityProbe(onUserScroll: userDidScroll,
+                                                onScrollEnded: userScrollEnded,
+                                                onSynthesizedScroll: synthesizedScroll,
+                                                follow: follow)
+                                .frame(width: 0, height: 0)
+                                .allowsHitTesting(false)
+                        }
+                        // RTL from the actual transcript text, not just the
+                        // language field: a recording made on "auto"/English
+                        // while the speaker talked Hebrew still has `language`
+                        // != "he", which left Hebrew transcripts LEFT-aligned.
+                        // SegmentRow uses `.leading`, so layoutDirection mirrors
+                        // it to the right exactly once. `transcriptLanguage`,
+                        // not `language`: while a re-run in the other language
+                        // is in flight the text is still the earlier one (#330).
+                        .environment(\.layoutDirection,
+                                     (recording.transcriptLanguage == "he" || recording.fullText.isPredominantlyHebrew)
+                                     ? .rightToLeft : .leftToRight)
+                    }
+                    .contextMenu { transcriptMenuItems }
+                    .coordinateSpace(name: Self.transcriptSpace)
+                    .onPreferenceChange(ActiveRowFrameKey.self) { rect in
+                        // Written to the coordinator, not @State: this fires on
+                        // every scrolled frame and a @State write would re-lay out
+                        // the transcript each time.
+                        follow.activeRowFrame = rect
+                    }
+                    // Keyed on the segment ID, NOT on currentTime: the periodic
+                    // time observer ticks 30x/sec, so keying on time would start
+                    // 30 scroll animations a second.
+                    .onChange(of: activeSegmentID) { _, id in
+                        guard isFollowing, let id else { return }
+                        scrollToActive(proxy, id: id)
+                    }
+                    .overlay(alignment: .bottom) { followPill(proxy) }
+                    .animation(.easeOut(duration: 0.2), value: isFollowing)
+                    .background {
+                        // ⌘⌫ deletes the selected lines (after confirming).
+                        // Disabled unless there is a selection — and while the
+                        // title is being edited — so it never swallows ⌘⌫
+                        // ("delete to start of line") meant for a text field.
+                        Button("Delete Selected Lines") { requestDelete(selection.ids) }
+                            .keyboardShortcut(.delete, modifiers: .command)
+                            .disabled(selection.isEmpty || !canEditTranscript || isEditingTitle)
+                            .opacity(0)
+                            .frame(width: 0, height: 0)
+                            .accessibilityHidden(true)
+                    }
+                    .alert(pendingTrim?.title ?? "",
+                           isPresented: Binding(get: { pendingTrim != nil },
+                                                set: { if !$0 { pendingTrim = nil } }),
+                           presenting: pendingTrim) { edit in
+                        Button(edit.confirmLabel, role: .destructive) {
+                            pendingTrim = nil
+                            perform(edit)
+                        }
+                        Button("Cancel", role: .cancel) { pendingTrim = nil }
+                    } message: { edit in
+                        Text(trimConfirmationMessage(for: edit))
+                    }
+                }
+            }
+            // Presented HERE, not inside the speaker popover: the tap that
+            // asks for a merge also dismisses that popover, and an alert
+            // attached to a disappearing view is how the previous attempt at
+            // this action ended up doing nothing. Merging is destructive and
+            // has no undo, so it is always confirmed.
+            .alert("Merge speakers?",
+                   isPresented: Binding(get: { pendingMerge != nil },
+                                        set: { if !$0 { pendingMerge = nil } }),
+                   presenting: pendingMerge) { merge in
+                Button("Merge", role: .destructive) {
+                    store.mergeSpeakers(from: merge.source, into: merge.target,
+                                        recordingID: recording.id)
+                    pendingMerge = nil
+                }
+                Button("Cancel", role: .cancel) { pendingMerge = nil }
+            } message: { merge in
+                Text("Every line from \(merge.sourceName) becomes \(merge.targetName). This can't be undone.")
+            }
+        }
+    }
+
+    /// A merge the user asked for and has not yet confirmed.
+    struct PendingSpeakerMerge: Identifiable {
+        let source: String
+        let target: String
+        let sourceName: String
+        let targetName: String
+        var id: String { "\(source)->\(target)" }
+    }
+
+    /// A transcript trim the user asked for and has not yet confirmed (#357).
+    struct PendingTranscriptEdit: Identifiable {
+        enum Kind {
+            /// Remove these lines; the audio is kept.
+            case delete(Set<TranscriptSegment.ID>)
+            /// Remove every line after this one and cut the audio at
+            /// `audioCut` (nil when this file's audio cannot be trimmed).
+            case endHere(TranscriptSegment.ID, audioCut: Double?)
+        }
+        let kind: Kind
+        /// How many lines the edit removes.
+        let lineCount: Int
+        let id = UUID()
+
+        var title: String {
+            switch kind {
+            case .delete:
+                return lineCount == 1 ? "Delete this line?" : "Delete \(lineCount) lines?"
+            case .endHere:
+                return "End the conversation here?"
+            }
+        }
+
+        var confirmLabel: String {
+            switch kind {
+            case .delete: return "Delete"
+            case .endHere: return "End Here"
+            }
+        }
+    }
+
+    // MARK: - Transcript selection and trimming (#357)
+
+    /// Whether the transcript can be trimmed right now: not while a
+    /// transcription pass is queued or running for it, nor while the
+    /// post-stop speaker pass is still to write its labels back — either
+    /// would put the deleted lines back — and only with lines to trim.
+    /// `isAwaitingSpeakerFinalization` is read here (not only through the
+    /// store's blocker) so the published marker re-renders the menus when
+    /// it clears.
+    private var canEditTranscript: Bool {
+        !isTranscriptionBusy
+            && !transcription.isAwaitingSpeakerFinalization(recording.id)
+            && store.canEditTranscriptNow(recording)
+    }
+
+    /// Everything a row's context menu needs that is the same for every row,
+    /// resolved once per render.
+    struct RowMenuContext {
+        let canTrim: Bool
+        let lastID: TranscriptSegment.ID?
+        let lineCount: Int
+        let selectionCount: Int
+    }
+
+    /// Click = select this line (and, as before, seek to it); shift-click =
+    /// extend from the anchor; command-click = toggle one line. Only the
+    /// plain click moves playback, so building a selection does not make
+    /// the audio jump around.
+    private func rowClicked(_ seg: TranscriptSegment) {
+        let flags = NSEvent.modifierFlags
+        let kind: TranscriptSelection.Click
+        if flags.contains(.shift) {
+            kind = .extend
+        } else if flags.contains(.command) {
+            kind = .toggle
+        } else {
+            kind = .plain
+        }
+        selection = selection.clicking(seg.id, kind: kind, order: recording.segments.map(\.id))
+        if kind == .plain {
+            // Tapping a line is an explicit "go here", so it re-engages
+            // following.
+            isFollowing = true
+            seek(to: seg.start)
+        }
+    }
+
+    private func pruneSelection() {
+        selection = selection.pruned(to: recording.segments.map(\.id))
+    }
+
+    /// A line's context menu. Built on every render for every loaded row, so
+    /// it does only O(1) work here: the deletion target (a set) is resolved
+    /// inside the action, when the item is actually picked.
+    @ViewBuilder
+    private func segmentContextMenu(for segmentID: TranscriptSegment.ID,
+                                    context: RowMenuContext) -> some View {
+        // Right-clicking a line inside the selection acts on the selection;
+        // any other line acts on itself (`deletionTarget`).
+        let count = selection.contains(segmentID) ? context.selectionCount : 1
+        let deleteLabel: String = count > 1 ? "Delete \(count) Segments" : "Delete Segment"
+        Button("End Conversation Here") { requestEndConversation(after: segmentID) }
+            .disabled(!context.canTrim || segmentID == context.lastID)
+        Button(deleteLabel) {
+            requestDelete(selection.deletionTarget(forContextClickOn: segmentID))
+        }
+        .disabled(!context.canTrim || count >= context.lineCount)
+        Divider()
+        transcriptMenuItems
+    }
+
+    /// The transcript-wide entries, shared by the menu on the transcript's
+    /// background and every line's menu (which replaces it under the
+    /// pointer). Re-transcribe is gated on a pass being queued or running,
+    /// as the header's Re-transcribe menu is.
+    @ViewBuilder
+    private var transcriptMenuItems: some View {
+        let other = RecordingLanguage.fromCode(recording.language).other
+        Button("Re-transcribe in \(other.flagEmoji) \(other.displayName)") {
+            retranscribe(in: other)
+        }
+        .disabled(isTranscriptionBusy)
+        Button("Copy transcript") { copyTranscript() }
+            .disabled(recording.fullText.isEmpty)
+    }
+
+    private func requestDelete(_ ids: Set<TranscriptSegment.ID>) {
+        let live = Set(recording.segments.map(\.id))
+        let target = ids.intersection(live)
+        // Nothing to delete, or everything: emptying the transcript is not a
+        // trim (delete the recording instead), and the store refuses it too.
+        guard canEditTranscript, !target.isEmpty, target.count < live.count else {
+            NSSound.beep()
+            return
+        }
+        pendingTrim = PendingTranscriptEdit(kind: .delete(target), lineCount: target.count)
+    }
+
+    private func requestEndConversation(after segmentID: TranscriptSegment.ID) {
+        let removed = TranscriptTrim.linesAfter(segmentID, in: recording.segments)
+        guard canEditTranscript, removed > 0 else { return }
+        let cut = store.canTrimAudio(for: recording)
+            ? TranscriptTrim.audioCutTime(endingAt: segmentID, in: recording.segments)
+            : nil
+        pendingTrim = PendingTranscriptEdit(kind: .endHere(segmentID, audioCut: cut),
+                                            lineCount: removed)
+    }
+
+    /// Whether a trim should regenerate the AI summary + action items: only
+    /// when there is one to replace and the user has summaries on. Otherwise
+    /// the confirmation says the summary is left as it is.
+    private var trimRegeneratesOverview: Bool {
+        hasOverviewToCopy && llmSettings.isConfigured && llmSettings.summaryEnabled
+    }
+
+    private func trimConfirmationMessage(for edit: PendingTranscriptEdit) -> String {
+        var parts: [String] = []
+        switch edit.kind {
+        case .delete:
+            parts.append(edit.lineCount == 1
+                ? "The line is removed from the transcript, its text and subtitle files, and what Mila serves to connected AI tools."
+                : "The lines are removed from the transcript, its text and subtitle files, and what Mila serves to connected AI tools.")
+            parts.append("The audio is kept, so re-transcribing this recording brings them back.")
+        case .endHere(_, let cut):
+            let lines = edit.lineCount == 1 ? "The line after this one is" : "All \(edit.lineCount) lines after this one are"
+            if let cut {
+                parts.append("\(lines) removed, and the audio is cut at \(formatDuration(cut)).")
+            } else {
+                parts.append("\(lines) removed. This recording's audio can't be trimmed, so it is kept in full.")
+            }
+        }
+        if hasOverviewToCopy {
+            parts.append(trimRegeneratesOverview
+                ? "The AI summary and action items will be regenerated from what remains."
+                : "The AI summary and action items are not updated and may still mention what was removed.")
+        }
+        parts.append("This can't be undone.")
+        return parts.joined(separator: " ")
+    }
+
+    private func perform(_ edit: PendingTranscriptEdit) {
+        let recordingID = recording.id
+        let regenerate = trimRegeneratesOverview
+        // Captured before any await: an environment object read from a task
+        // that outlives this view is not something to rely on.
+        let store = self.store
+        let summarizer = self.summarizer
+        switch edit.kind {
+        case .delete(let ids):
+            guard let updated = store.deleteSegments(ids, recordingID: recordingID) else { return }
+            selection = selection.pruned(to: updated.segments.map(\.id))
+            if regenerate { summarizer.regenerate(updated) }
+        case .endHere(let segmentID, _):
+            selection = TranscriptSelection()
+            // Touches no view state, so it is safe to outlive this view. An
+            // audio cut that did not happen is reported by the store itself
+            // (`trimNotice`, shown by ContentView), not from here.
+            Task { @MainActor in
+                guard let result = await store.endConversation(afterSegment: segmentID,
+                                                               recordingID: recordingID) else { return }
+                if regenerate { summarizer.regenerate(result.recording) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var playbackBar: some View {
+        if let player {
+            HStack {
+                PlayPauseButton(player: player)
+                Slider(value: Binding(get: { currentTime },
+                                      set: { seek(to: $0) }),
+                       in: 0...max(recording.duration, 0.1))
+                Text(formatDuration(currentTime))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .frame(width: 60, alignment: .trailing)
+                speedMenu
+            }
+            .padding()
+        }
+    }
+
+    /// Playback speed picker. Borderless menu labelled with the current rate,
+    /// matching `LanguagePickerToolbarItem` in ContentView.
+    private var speedMenu: some View {
+        // The selection goes through `nearest(to:)` for the same reason the
+        // label does: the stored default is a plain `Double`, and one that
+        // doesn't match a case exactly matches no `tag` either — leaving the
+        // menu with NO row checked while the label and the player both read
+        // the snapped rate. Writing back through the raw binding normalises
+        // the stored value the first time the user picks a speed.
+        let selection = Binding(get: { PlaybackSpeed.nearest(to: playbackSpeed).rawValue },
+                                set: { playbackSpeed = $0 })
+        return Menu {
+            Picker("Playback speed", selection: selection) {
+                ForEach(PlaybackSpeed.allCases) { speed in
+                    Text(speed.label).tag(speed.rawValue)
+                }
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+        } label: {
+            // Fixed width so switching between "1×" and "1.25×" doesn't resize
+            // the seek slider next to it.
+            Text(PlaybackSpeed.nearest(to: playbackSpeed).label)
+                .monospacedDigit()
+                .frame(width: 46, alignment: .trailing)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Playback speed")
+        .accessibilityIdentifier("detail.playback.speed")
+    }
+
+    /// Active line sits 35% down the viewport — close enough to centre to feel
+    /// stable, high enough that most of the screen shows what's coming next.
+    private static let followAnchor = UnitPoint(x: 0.5, y: 0.35)
+    private static let transcriptSpace = "detail.transcript.scroll"
+
+    /// The segment covering `time`, as a pure function so TranscriptFollowTests
+    /// can pin the boundary and silence-gap cases without building the view.
+    /// Intervals are half-open — `start` inclusive, `end` exclusive — so a pause
+    /// between segments correctly yields nil.
+    static func activeSegmentID(segments: [TranscriptSegment],
+                                at time: Double) -> TranscriptSegment.ID? {
+        segments.first { time >= $0.start && time < $0.end }?.id
+    }
+
+    private var activeSegmentID: TranscriptSegment.ID? {
+        Self.activeSegmentID(segments: recording.segments, at: currentTime)
+    }
+
+    private func scrollToActive(_ proxy: ScrollViewProxy, id: TranscriptSegment.ID) {
+        follow.suppress()
+        withAnimation(.easeOut(duration: 0.25)) {
+            proxy.scrollTo(id, anchor: Self.followAnchor)
+        }
+    }
+
+    /// Reached from the live-scroll notifications, which AppKit posts ONLY for
+    /// user gestures — never for our own `scrollTo`. So no suppression check
+    /// here: swallowing these was discarding real scrolls that happened to
+    /// start inside the 0.45s window an auto-scroll had just opened (a
+    /// mouse-wheel scroll posts no trailing momentum events to recover with,
+    /// so the next segment change simply yanked the view back).
+    private func userDidScroll() {
+        guard isFollowing else { return }
+        isFollowing = false
+    }
+
+    private func userScrollEnded() {
+        guard !isFollowing else { return }
+        // A small nudge that left the highlight on screen resumes following;
+        // scrolling properly away leaves the pill up. No scroll is issued here —
+        // letting the next segment change re-centre is gentler than yanking the
+        // view the instant the user lets go.
+        if follow.activeRowIsVisible { isFollowing = true }
+    }
+
+    /// The bounds fallback's start-and-end-together report. This one CAN fire
+    /// for a scroll we started ourselves, so it is the one that consults the
+    /// suppression window.
+    private func synthesizedScroll() {
+        guard !follow.isSuppressed else { return }
+        userDidScroll()
+        userScrollEnded()
+    }
+
+    /// Floating "Follow playback" affordance, shown only while following is off
+    /// AND playback has actually moved. Without the `currentTime` gate, scrolling
+    /// a transcript you never played would pop a button with nothing to follow.
+    @ViewBuilder
+    private func followPill(_ proxy: ScrollViewProxy) -> some View {
+        if !isFollowing, currentTime > 0 {
+            Button {
+                isFollowing = true
+                if let id = activeSegmentID { scrollToActive(proxy, id: id) }
+            } label: {
+                Label("Follow playback", systemImage: "arrow.down.circle.fill")
+                    .font(.callout)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: Capsule())
+                    .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08),
+                                                    lineWidth: 1))
+                    .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+            }
+            .buttonStyle(.plain)
+            .padding(.bottom, 16)
+            .help("Resume following playback in the transcript")
+            .accessibilityIdentifier("detail.transcript.followPlayback")
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
+
+    private func configurePlayer() {
+        teardownPlayer()
+        let url = store.audioURL(for: recording)
+        let item = AVPlayerItem(url: url)
+        // `.timeDomain` is Apple's recommended algorithm for voice — it keeps
+        // pitch natural at 0.5×/2× and costs less than AVPlayer's `.spectral`
+        // default, which smears speech at the higher rates.
+        item.audioTimePitchAlgorithm = .timeDomain
+        let p = AVPlayer(playerItem: item)
+        // `defaultRate` (macOS 13+) is what a bare `play()` resumes at, so
+        // PlayPauseButton needs no knowledge of the speed setting.
+        p.defaultRate = Float(PlaybackSpeed.nearest(to: playbackSpeed).rawValue)
+        timeObserver = p.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 30),
+                                                  queue: .main) { time in
+            currentTime = time.seconds.isFinite ? time.seconds : 0
+        }
+        player = p
+    }
+
+    private func teardownPlayer() {
+        if let player, let observer = timeObserver {
+            player.removeTimeObserver(observer)
+        }
+        timeObserver = nil
+        player?.pause()
+        player = nil
+    }
+
+    private func seek(to seconds: Double) {
+        let time = CMTime(seconds: seconds, preferredTimescale: 600)
+        player?.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+        currentTime = seconds
+    }
+
+    private func copyTranscript() {
+        let text = TranscriptFormatter.plainText(segments: recording.segments,
+                                                 fallback: recording.fullText,
+                                                 names: recording.speakerNames)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    /// Whether there's any AI overview content (summary or action items)
+    /// to copy. Gates the header's "Copy summary + action items" button.
+    private var hasOverviewToCopy: Bool {
+        let hasSummary = recording.summary?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false
+        let hasItems = !(recording.actionItems ?? []).isEmpty
+        return hasSummary || hasItems
+    }
+
+    /// Copy the AI overview (summary + action items) as plain text: the
+    /// summary first, then — separated by a blank line — the action items
+    /// as `•\u{00A0}…` lines. Only the parts that actually exist are
+    /// included, so a summary-only or items-only recording copies cleanly.
+    private func copyOverview() {
+        var parts: [String] = []
+        if let summary = recording.summary?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !summary.isEmpty {
+            parts.append(summary)
+        }
+        let items = recording.actionItems ?? []
+        if !items.isEmpty {
+            parts.append(items.map { "•\u{00A0}\($0.text)" }.joined(separator: "\n"))
+        }
+        guard !parts.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(parts.joined(separator: "\n\n"), forType: .string)
+    }
+}
+
+private struct PlayPauseButton: View {
+    let player: AVPlayer
+    /// Stable local state. The previous design wrapped the player in a
+    /// `PlayerBridge` ObservableObject and used `@ObservedObject`,
+    /// which RE-INSTANTIATED the bridge (and a fresh KVO observer)
+    /// on every parent re-render. As soon as playback started, the
+    /// time observer in `configurePlayer` fired ~30×/sec and forced
+    /// re-renders of the playback bar — each one tore down the old
+    /// bridge, briefly read `timeControlStatus == .paused` while the
+    /// new bridge was warming up, and flipped the icon back to "play"
+    /// for one frame before the KVO callback caught up. Hence the
+    /// flicker. Owning a plain @State Bool + a single long-lived
+    /// observer in onAppear is enough.
+    @State private var isPlaying: Bool = false
+    @State private var observer: NSKeyValueObservation?
+
+    var body: some View {
+        Button {
+            if player.timeControlStatus == .playing {
+                player.pause()
+            } else {
+                // AVPlayer parks at end-of-item when playback finishes and
+                // a bare play() there is a no-op — the button looked dead
+                // after a memo played to the end until the user dragged the
+                // slider back. Rewind first in that case.
+                if let item = player.currentItem, item.duration.isNumeric,
+                   item.duration.seconds - player.currentTime().seconds <= 0.1 {
+                    player.seek(to: .zero)
+                }
+                player.play()
+            }
+        } label: {
+            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                .frame(width: 18, height: 18)
+        }
+        .buttonStyle(.borderedProminent)
+        .onAppear {
+            isPlaying = (player.timeControlStatus == .playing)
+            // KVO on timeControlStatus is enough — fires on every
+            // transition between paused / waiting / playing.
+            observer = player.observe(\.timeControlStatus, options: [.new]) { p, _ in
+                DispatchQueue.main.async {
+                    isPlaying = (p.timeControlStatus == .playing)
+                }
+            }
+        }
+        .onDisappear {
+            observer?.invalidate()
+            observer = nil
+        }
+    }
+}
+
+/// Live-AI summary + action items, captured at recording stop time and
+/// persisted onto the Recording. Extracted into its own `View` rather
+/// than a `@ViewBuilder` var on the parent so the body's type inference
+/// is contained: a SwiftUI hiccup inside this section never silently
+/// blanks the rest of the detail screen, which is the symptom the user
+/// was hitting when both the sidebar and the detail pane went empty
+/// after transcription completed.
+/// Detail-screen wrapper around the shared `AIOverviewSection` (which
+/// renders Summary + Action items). The wrapper caps the section at
+/// 240 pt inside a `ScrollView` and adds a trailing `Divider` so a
+/// recording with many action items or a long summary can NEVER push
+/// the transcript / playback bar off-screen.
+private struct AIOverviewBanner: View {
+    let summary: String?
+    let items: [ActionItem]
+    let recordingLanguage: String
+    /// Forwarded to `AIOverviewSection` so the summary block shows a
+    /// "Summarizing…" spinner while a regenerate / backfill call is in
+    /// flight.
+    var isSummarizing: Bool = false
+    /// Forwarded to `AIOverviewSection`'s context-menu wiring. nil
+    /// hides the "Regenerate summary" item (e.g. when no LLM is
+    /// configured or the transcript is empty).
+    var onRegenerateSummary: (() -> Void)? = nil
+    /// Forwarded to `AIOverviewSection` for its "Summary language" submenu.
+    var summaryLanguage: RecordingLanguage? = nil
+    var globalOutputLanguage: LiveAISettings.OutputLanguage = .auto
+    var onSetSummaryLanguage: ((RecordingLanguage?) -> Void)? = nil
+    /// Forwarded to `AIOverviewSection.isTranscribing`.
+    var isTranscribing: Bool = false
+
+    var body: some View {
+        let section = AIOverviewSection(
+            summary: summary,
+            items: items,
+            recordingLanguage: recordingLanguage,
+            onRegenerateSummary: onRegenerateSummary,
+            isSummarizing: isSummarizing,
+            // The detail view consolidates copy into two location-based
+            // buttons (Summary+Action-items up top, transcript in the
+            // transcript area), so the per-block header copy buttons are
+            // hidden here. The block's native right-click "Copy" stays.
+            showsBlockCopyButtons: false,
+            summaryLanguage: summaryLanguage,
+            globalOutputLanguage: globalOutputLanguage,
+            onSetSummaryLanguage: onSetSummaryLanguage,
+            isTranscribing: isTranscribing
+        )
+        if section.hasContent {
+            VStack(spacing: 0) {
+                ScrollView {
+                    section
+                        .padding(.horizontal)
+                        .padding(.vertical, 12)
+                }
+                // Hard cap so a recording with many action items or a
+                // long summary can NEVER push the transcript /
+                // playback bar off-screen. The inner content scrolls
+                // independently inside this slot if it exceeds 240 pt.
+                .frame(maxHeight: 240)
+                Divider()
+            }
+        }
+    }
+}
+
+/// Pending speaker-name suggestions (issue #348), one row each, with a
+/// one-click Accept and a Dismiss. Renders nothing when there are none, so a
+/// recording without suggestions looks exactly as before.
+///
+/// Each row shows WHY: the transcript quote the model pointed at (verified to
+/// be in the transcript), or, for "Your name", that it is the only voice on a
+/// recording from this Mac's microphone. A suggestion is never applied on its
+/// own — see `SpeakerNameSuggestion`.
+private struct SpeakerNameSuggestionsBanner: View {
+    let suggestions: [SpeakerNameSuggestion]
+    /// Transcript language, for the "Speaker A" / "דובר א׳" label.
+    let language: String
+    let onAccept: (SpeakerNameSuggestion) -> Void
+    let onDismiss: (SpeakerNameSuggestion) -> Void
+
+    /// Rows shown at their natural height. Beyond this the list scrolls
+    /// inside a fixed slot, so a recording with many speakers can never push
+    /// the transcript or the playback bar off-screen — the same guarantee
+    /// `AIOverviewBanner` gives the summary. Each row is at most three lines
+    /// (`lineLimit(2)` on the reason), so up to this many stay small.
+    static let maxUnscrolledRows = 3
+    /// Height of the scrolling slot once there are more rows than that.
+    static let scrollingHeight: CGFloat = 150
+
+    var body: some View {
+        if !suggestions.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Suggested speaker names", systemImage: "person.crop.circle.badge.questionmark")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    if suggestions.count > Self.maxUnscrolledRows {
+                        ScrollView {
+                            rows
+                        }
+                        .frame(height: Self.scrollingHeight)
+                    } else {
+                        rows
+                    }
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 10)
+                Divider()
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("detail.speakerNameSuggestions")
+        }
+    }
+
+    private var rows: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(suggestions) { suggestion in
+                row(suggestion)
+            }
+        }
+    }
+
+    private func row(_ suggestion: SpeakerNameSuggestion) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(suggestion.speaker.friendlySpeakerLabel(language: language)) \u{2192} \(suggestion.name)")
+                    .font(.callout)
+                Text(reason(for: suggestion))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Accept") { onAccept(suggestion) }
+                .controlSize(.small)
+                .help("Name this speaker \u{201C}\(suggestion.name)\u{201D}")
+                .accessibilityIdentifier("detail.speakerNameSuggestion.accept.\(suggestion.speaker)")
+            Button {
+                onDismiss(suggestion)
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+            .help("Dismiss this suggestion")
+            .accessibilityLabel(Text("Dismiss"))
+            .accessibilityIdentifier("detail.speakerNameSuggestion.dismiss.\(suggestion.speaker)")
+        }
+    }
+
+    private func reason(for suggestion: SpeakerNameSuggestion) -> String {
+        switch suggestion.origin {
+        case .localUser:
+            return "Your name \u{2014} the only voice in a recording from your microphone."
+        case .transcript:
+            return "\u{201C}\(suggestion.evidence)\u{201D}"
+        }
+    }
+}
+
+private struct SegmentRow: View {
+    let segment: TranscriptSegment
+    let isActive: Bool
+    /// Picked for "Delete Segments" / ⌘⌫. Drawn as an outline so it stays
+    /// distinguishable from — and combinable with — the playback highlight.
+    var isSelected: Bool = false
+    let showSpeaker: Bool
+    /// Whether to color the speaker label per-speaker rather than the
+    /// default tint — set by the caller once it's seen more than one
+    /// distinct speaker across the recording.
+    let useSpeakerColor: Bool
+    /// Recording's language so we can render the raw `SPEAKER_00`
+    /// label from pyannote as `Speaker A` / `דובר א׳` in the user's
+    /// language — matching the labels the live view + post-recording
+    /// action items already show.
+    let language: String
+    /// User-assigned speaker names for this recording (raw ID → name).
+    let speakerNames: [String: String]
+    /// Every distinct raw speaker id in the recording, in transcript order.
+    /// The popover offers the ones that aren't this row's as move/merge
+    /// targets.
+    let allSpeakers: [String]
+    let onTap: () -> Void
+    /// Persists a rename picked from the label's popover:
+    /// (raw speaker ID, chosen name or nil-to-reset).
+    let onAssignName: (String, String?) -> Void
+    /// Split this segment into a new unnamed speaker.
+    var onSplit: (() -> Void)?
+    /// Move just this segment to the given raw speaker id.
+    var onMoveLine: ((String) -> Void)?
+    /// Ask to merge this row's speaker (first argument) into another raw id.
+    /// The caller confirms before anything happens.
+    var onRequestMerge: ((_ from: String, _ into: String) -> Void)?
+
+    /// The other speakers, resolved to what the transcript shows for them.
+    private func otherSpeakers(besides raw: String) -> [SpeakerChoice] {
+        allSpeakers.filter { $0 != raw }.map {
+            SpeakerChoice(rawID: $0,
+                          displayName: $0.displaySpeakerName(names: speakerNames,
+                                                             language: language))
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            // Speaker prefix sits TIGHT against the text — fixed-width
+            // columns introduced a gap (~30 pt) between the friendly
+            // label "Speaker A" / "דובר א׳" and the actual content.
+            // `fixedSize` keeps the label at its natural width.
+            if showSpeaker, let raw = segment.speaker, !raw.isEmpty {
+                SpeakerLabelButton(
+                    rawID: raw,
+                    names: speakerNames,
+                    language: language,
+                    color: useSpeakerColor ? raw.speakerColor(names: speakerNames) : Color.accentColor,
+                    suffix: ":",
+                    onAssign: { name in onAssignName(raw, name) },
+                    onSplit: onSplit,
+                    otherSpeakers: otherSpeakers(besides: raw),
+                    onMoveLine: onMoveLine,
+                    // Bind this row's speaker as the merge SOURCE; the picker
+                    // only supplies the target.
+                    onRequestMerge: onRequestMerge == nil ? nil : { target in
+                        onRequestMerge?(raw, target)
+                    }
+                )
+                .fixedSize(horizontal: true, vertical: false)
+            }
+            Text(segment.text)
+                .font(.body)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(formatDuration(segment.start))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .fixedSize()
+        }
+        .padding(8)
+        .background(isActive ? Color.accentColor.opacity(0.18) : .clear,
+                    in: RoundedRectangle(cornerRadius: 6))
+        .overlay {
+            if isSelected {
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(Color.accentColor, lineWidth: 1.5)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { onTap() }
+    }
+}
+
+/// Mutable scroll-following state that must NOT drive view updates.
+///
+/// The scroll probe and the active-row preference write here on every scrolled
+/// frame; routing that through `@State` would re-lay out the whole transcript
+/// each time. All access is on the main thread, hence `@unchecked Sendable`.
+private final class FollowCoordinator: @unchecked Sendable {
+    /// Frame of the highlighted row in the ScrollView's own coordinate space,
+    /// or nil when no segment is active or the LazyVStack has unloaded it.
+    var activeRowFrame: CGRect?
+    var viewportHeight: CGFloat = 0
+
+    private var suppressUntil = Date.distantPast
+
+    /// True while a scroll WE started may still be moving the clip view, so its
+    /// bounds changes aren't mistaken for the user scrolling.
+    var isSuppressed: Bool { Date() < suppressUntil }
+
+    /// Slightly longer than the 0.25s scroll animation.
+    func suppress(for interval: TimeInterval = 0.45) {
+        suppressUntil = Date().addingTimeInterval(interval)
+    }
+
+    /// Frames are relative to the viewport, so a row scrolled off the top has a
+    /// negative maxY and one below the fold has minY past the viewport height.
+    var activeRowIsVisible: Bool {
+        guard let frame = activeRowFrame, viewportHeight > 0 else { return false }
+        return frame.maxY > 0 && frame.minY < viewportHeight
+    }
+}
+
+/// Carries the highlighted row's frame out of the transcript. Only the active
+/// row ever publishes a value, so `reduce` just keeps the non-nil one.
+private struct ActiveRowFrameKey: PreferenceKey {
+    static let defaultValue: CGRect? = nil
+    static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) {
+        value = nextValue() ?? value
+    }
+}
+
+/// Whether a raw clip-bounds change should be reported as a complete manual
+/// scroll gesture.
+///
+/// The live-scroll notifications are the real signal and they bracket a gesture
+/// properly: `didLiveScroll` while it moves, `didEndLiveScroll` once, at the end.
+/// This fallback exists only for the paths that post NEITHER — Page Up/Down and
+/// the arrow keys — and it reports a start AND an end together, because those
+/// paths move the view in one jump.
+///
+/// That is exactly why it has to stay silent during a live scroll. Firing it
+/// mid-flick calls `onScrollEnded` while the user is still scrolling, which
+/// re-engages following the moment any part of the highlighted row is on screen;
+/// the programmatic scroll that the next segment change then issues fights the
+/// gesture, and its 0.45s suppression window swallows the user's continuing
+/// scroll on top of that.
+enum ScrollGesturePolicy {
+    /// - Parameters:
+    ///   - isLiveScrolling: whether the scroll view is between
+    ///     `willStart`/`didLiveScroll` and `didEndLiveScroll`.
+    ///   - isLiveResizing: whether the scroll view is inside a live resize —
+    ///     AppKit's own signal for "this bounds change is the window or the
+    ///     split-view divider being dragged, not the content being scrolled".
+    ///   - event: `NSApp.currentEvent?.type`, used to tell a user-driven bounds
+    ///     change from a layout-driven one (window resize, the LazyVStack
+    ///     loading more rows).
+    ///   - eventIsOverScrollView: whether that event's location is inside the
+    ///     scroll view. Only consulted for the mouse cases — see below.
+    ///
+    /// `.scrollWheel` is deliberately absent from the accepted types: a wheel or
+    /// trackpad scroll that moves the clip view always goes through the
+    /// live-scroll path, so accepting it here only re-opens the window this
+    /// guard exists to close — including for the trailing bounds change that
+    /// lands just after `didEndLiveScroll`.
+    ///
+    /// The mouse cases additionally need `eventIsOverScrollView`. A scroller
+    /// drag is a `.leftMouseDragged` INSIDE the scroll view; dragging the
+    /// window's edge or the split-view divider is the very same event type
+    /// OUTSIDE it, and also moves the clip view — AppKit clamps
+    /// `bounds.origin.y` as the content re-flows. Accepting those would
+    /// disengage following on a window resize, which is precisely the
+    /// layout-driven change this guard is meant to ignore. Keyboard scrolling
+    /// (Page Up/Down, the arrow keys) has no meaningful location, so it is
+    /// judged on the event type alone.
+    ///
+    /// `isLiveResizing` backs the location test up rather than duplicating it,
+    /// because the two have different blind spots. The transcript runs to the
+    /// window's right edge, so a right-edge resize CAN put the pointer inside
+    /// the scroll view's bounds; conversely a divider drag is comfortably
+    /// outside it but may not always raise live resize. Either signal alone
+    /// leaves a gap, so a bounds change is a scroll only if neither fires.
+    static func shouldSynthesizeGesture(isLiveScrolling: Bool,
+                                        isLiveResizing: Bool,
+                                        event: NSEvent.EventType?,
+                                        eventIsOverScrollView: Bool) -> Bool {
+        guard !isLiveScrolling, !isLiveResizing, let event else { return false }
+        switch event {
+        case .leftMouseDown, .leftMouseDragged, .leftMouseUp, .otherMouseDragged:
+            return eventIsOverScrollView
+        case .keyDown:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+/// Detects user-driven scrolling in the enclosing `NSScrollView`.
+///
+/// macOS 14 is the deployment target, so `onScrollGeometryChange` (macOS 15+)
+/// is unavailable, and SwiftUI on 14 gives no way to tell our own animated
+/// `scrollTo` from a trackpad flick. AppKit does: live-scroll notifications are
+/// posted only for user gestures, never for programmatic scrolls.
+private struct ScrollActivityProbe: NSViewRepresentable {
+    let onUserScroll: () -> Void
+    let onScrollEnded: () -> Void
+    /// The bounds fallback's start-and-end-together report. Separate from the
+    /// live-scroll pair because only this one can fire for a scroll WE started,
+    /// so only this one is subject to the suppression window.
+    let onSynthesizedScroll: () -> Void
+    let follow: FollowCoordinator
+
+    func makeNSView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        configure(view)
+        return view
+    }
+
+    func updateNSView(_ nsView: ProbeView, context: Context) {
+        configure(nsView)
+    }
+
+    private func configure(_ view: ProbeView) {
+        view.configure(onUserScroll: onUserScroll,
+                       onScrollEnded: onScrollEnded,
+                       onSynthesizedScroll: onSynthesizedScroll,
+                       follow: follow)
+    }
+
+    final class ProbeView: NSView {
+        private var onUserScroll: (() -> Void)?
+        private var onScrollEnded: (() -> Void)?
+        private var onSynthesizedScroll: (() -> Void)?
+        private var follow: FollowCoordinator?
+        private var observers: [NSObjectProtocol] = []
+        private var lastOriginY: CGFloat = .nan
+        /// True between the start and end of a user's live scroll, so the
+        /// bounds fallback can stay out of the way while one is running.
+        private var isLiveScrolling = false
+        /// The scroll view we attached to, kept so `boundsChanged` can ask
+        /// whether the current event happened over it.
+        private weak var scrollView: NSScrollView?
+        private var attachAttempts = 0
+        /// ~1s of retries in total: mounting takes a run loop pass or two, so
+        /// anything still unresolved after this is not going to resolve.
+        private static let maxAttachAttempts = 20
+        private static let attachRetryDelay: TimeInterval = 0.05
+
+        func configure(onUserScroll: @escaping () -> Void,
+                       onScrollEnded: @escaping () -> Void,
+                       onSynthesizedScroll: @escaping () -> Void,
+                       follow: FollowCoordinator) {
+            self.onUserScroll = onUserScroll
+            self.onScrollEnded = onScrollEnded
+            self.onSynthesizedScroll = onSynthesizedScroll
+            self.follow = follow
+        }
+
+        /// Zero-sized and transparent to clicks — it must never intercept a tap
+        /// meant for a transcript row.
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            attach()
+        }
+
+        deinit {
+            observers.forEach { NotificationCenter.default.removeObserver($0) }
+        }
+
+        private func attach() {
+            guard observers.isEmpty else { return }
+            guard let scrollView = enclosingScrollView else {
+                // The NSScrollView isn't in the hierarchy on the first pass;
+                // retry once SwiftUI has finished mounting.
+                //
+                // Bounded on purpose. A bare `DispatchQueue.main.async` that
+                // re-enqueues itself is a main-thread SPIN, not a poll: if the
+                // scroll view never resolves — a SwiftUI ScrollView that isn't
+                // NSScrollView-backed on some future macOS, or a probe laid out
+                // outside the clip view — it would pin the main thread at 100%
+                // for as long as the detail screen is open, with nothing in the
+                // logs (the #280 class of regression). Giving up instead costs
+                // only follow-on-manual-scroll detection.
+                guard window != nil, attachAttempts < Self.maxAttachAttempts else { return }
+                attachAttempts += 1
+                DispatchQueue.main.asyncAfter(deadline: .now() + Self.attachRetryDelay) {
+                    [weak self] in self?.attach()
+                }
+                return
+            }
+            self.scrollView = scrollView
+            let center = NotificationCenter.default
+            let clip = scrollView.contentView
+            clip.postsBoundsChangedNotifications = true
+            follow?.viewportHeight = clip.bounds.height
+            lastOriginY = clip.bounds.origin.y
+
+            observers.append(center.addObserver(forName: NSScrollView.willStartLiveScrollNotification,
+                                                object: scrollView, queue: .main) { [weak self] _ in
+                self?.isLiveScrolling = true
+            })
+            observers.append(center.addObserver(forName: NSScrollView.didLiveScrollNotification,
+                                                object: scrollView, queue: .main) { [weak self] _ in
+                // Momentum phases can post this without a preceding
+                // willStart, so set the flag here too rather than assuming
+                // the pair always arrives in order.
+                self?.isLiveScrolling = true
+                self?.onUserScroll?()
+            })
+            observers.append(center.addObserver(forName: NSScrollView.didEndLiveScrollNotification,
+                                                object: scrollView, queue: .main) { [weak self] _ in
+                self?.isLiveScrolling = false
+                self?.onScrollEnded?()
+            })
+            observers.append(center.addObserver(forName: NSView.boundsDidChangeNotification,
+                                                object: clip, queue: .main) { [weak self] _ in
+                self?.boundsChanged(clip)
+            })
+        }
+
+        private func boundsChanged(_ clip: NSClipView) {
+            follow?.viewportHeight = clip.bounds.height
+            let originY = clip.bounds.origin.y
+            defer { lastOriginY = originY }
+            guard abs(originY - lastOriginY) > 0.5 else { return }
+            let event = NSApp?.currentEvent
+            guard ScrollGesturePolicy.shouldSynthesizeGesture(
+                    isLiveScrolling: isLiveScrolling,
+                    isLiveResizing: scrollView?.inLiveResize ?? false,
+                    event: event?.type,
+                    eventIsOverScrollView: isOverScrollView(event)) else { return }
+            onSynthesizedScroll?()
+        }
+
+        /// Whether `event` happened over the scroll view itself — true for a
+        /// scroller drag, false for a window-edge or split-view divider drag,
+        /// which carry the same event types but move the clip view purely by
+        /// re-layout.
+        private func isOverScrollView(_ event: NSEvent?) -> Bool {
+            guard let event, let scrollView,
+                  let window = scrollView.window, event.window === window
+            else { return false }
+            return scrollView.bounds.contains(scrollView.convert(event.locationInWindow, from: nil))
+        }
+    }
+}

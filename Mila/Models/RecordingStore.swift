@@ -1,0 +1,2070 @@
+import Foundation
+import Combine
+import OSLog
+import MilaKit
+
+private let recStoreLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "RecordingStore")
+
+/// Persists recordings + their metadata under Application Support/Mila.
+///
+/// Two pre-rename locations exist:
+///   1. `Application Support/IvritWhisper` (the original product name).
+///   2. `Application Support/IslandWhisper` (the second product name).
+/// On first launch we transparently migrate from whichever of those
+/// exists into the new `Application Support/Mila` directory so users
+/// don't lose their already-downloaded models (~4.6 GB combined) or
+/// recordings. IslandWhisper takes precedence over IvritWhisper when
+/// both are somehow present (the user's latest data lives there).
+@MainActor
+final class RecordingStore: ObservableObject {
+    @Published private(set) var recordings: [Recording] = []
+    /// Folder names the user has explicitly created. Kept separate from the
+    /// set derived from `recordings[*].folder` so an empty folder still shows
+    /// up in the sidebar and survives moving its last recording elsewhere.
+    @Published private(set) var folders: [String] = []
+
+    /// Called when a speaker name is assigned (via setSpeakerName).
+    /// Provides the recording ID, raw speaker ID, and the name.
+    /// Used by voice recognition to save voice profiles.
+    var onSpeakerNamed: ((_ recordingID: UUID, _ rawID: String, _ name: String) -> Void)?
+
+    /// Called when a speaker name is cleared or replaced. Provides the
+    /// recording ID, raw speaker ID, and the *previous* name that was
+    /// removed. Used by voice recognition to subtract the recording's
+    /// observed embedding from the old profile.
+    var onSpeakerUnnamed: ((_ recordingID: UUID, _ rawID: String, _ previousName: String) -> Void)?
+
+    /// Called when a raw `SPEAKER_NN` id stops existing because its audio
+    /// became another speaker's — the source of a merge, or a speaker whose
+    /// last segment was reassigned away.
+    ///
+    /// Separate from `onSpeakerUnnamed`, which is about a *name*: a retired
+    /// id may never have had one, and its observed embedding is the thing
+    /// that outlives it. Two reasons voice recognition needs to hear about
+    /// it. The id comes *back* — `splitSegmentSpeaker` hands out the lowest
+    /// free number — and would otherwise resolve to the previous speaker's
+    /// voice. And the observation has to follow the audio onto the target,
+    /// because this store also moves the source's profile contribution
+    /// there; leaving the snapshot behind would make the target's profile
+    /// weight unreconstructible from its snapshot, and
+    /// `subtractObservation` is only an inverse of `updateProfile` while
+    /// those two agree.
+    var onSpeakerIDAbsorbed: ((_ recordingID: UUID, _ sourceRawID: String, _ targetRawID: String) -> Void)?
+
+    /// Called after the user removed lines from a recording's transcript
+    /// ("Delete Segment(s)" / "End Conversation Here", island-io/mila#357),
+    /// with the row as it now stands. The recording's own files are already
+    /// rewritten by then; this is for copies of the transcript the store
+    /// does not own — in production the completed live sidecar
+    /// (`live/current.json`), which keeps the meeting's live lines on disk
+    /// until the next recording starts and is served to mila-mcp. Deleted
+    /// lines must not stay readable there
+    /// (`bugbot-rules/deleted-data-stays-deleted.md`).
+    var onTranscriptLinesRemoved: ((Recording) -> Void)?
+
+    /// Emits the ids of recordings that were just permanently deleted, from
+    /// both removal primitives — `permanentlyDelete(_:)` and `emptyTrash()`
+    /// — after the rows have left `recordings`. Every caller that throws a
+    /// recording away for good (context menu, Queue "Remove", discard sheet,
+    /// the short-empty auto-drop, "Empty Recently Deleted") goes through one
+    /// of those two, so a subscriber here hears about all of them without
+    /// each call site having to remember it.
+    ///
+    /// `RecordingSummarizer` subscribes to cancel a summary call still out
+    /// for a deleted row: otherwise the `claude -p` / `cursor-agent` child
+    /// runs to completion, holding one of its `maxConcurrent` slots and
+    /// spending an LLM call on output that has nowhere to go.
+    ///
+    /// A subject rather than an `on…` closure because the subscriber lives
+    /// on an object (with its own cancellable bag), not in `MilaApp.init`,
+    /// and a subject lets more than one object listen. Moving a row to
+    /// Recently Deleted does NOT emit: that is reversible.
+    let permanentlyDeleted = PassthroughSubject<[UUID], Never>()
+
+    private let fileManager = FileManager.default
+    /// `storeURL` and `foldersURL` move with `recordingsDirectory` on
+    /// every `relocateRecordings` call. On the default path they live
+    /// alongside the `Recordings/` subdir (legacy layout); on a custom
+    /// path they live inside the chosen folder so the user-picked
+    /// directory is self-contained (one folder == recordings + their
+    /// metadata, portable across machines / cloud sync).
+    private(set) var storeURL: URL
+    private(set) var foldersURL: URL
+    /// Published so the Settings UI's "Current location" row updates the
+    /// moment the user picks a different folder.
+    @Published private(set) var recordingsDirectory: URL
+    let modelsDirectory: URL
+    /// The default recordings location (always inside Application
+    /// Support/Mila/Recordings). Used by Settings to label the
+    /// "Reset to default" button and to detect when a custom path is in
+    /// effect.
+    let defaultRecordingsDirectory: URL
+
+    convenience init() {
+        // UI tests pass --ui-test-clean-store to bypass the user's real
+        // Application Support directory and start from a fresh, deterministic
+        // state. We honor it before touching the real path so a test run
+        // never reads or writes the user's recordings.
+        if CommandLine.arguments.contains("--ui-test-clean-store") {
+            let tmpRoot = FileManager.default.temporaryDirectory
+                .appendingPathComponent("Mila-UITest-\(UUID())", isDirectory: true)
+            self.init(rootDirectory: tmpRoot)
+            if CommandLine.arguments.contains("--ui-test-seed-recording") {
+                let seed = Recording(
+                    title: "Seed Recording",
+                    duration: 1.5,
+                    source: .microphone,
+                    audioFileName: "seed.wav",
+                    status: .completed,
+                    language: "en",
+                    fullText: "Hello from the UI test seed recording."
+                )
+                self.add(seed)
+            }
+            return
+        }
+        let appSupport = try! FileManager.default.url(for: .applicationSupportDirectory,
+                                                      in: .userDomainMask,
+                                                      appropriateFor: nil,
+                                                      create: true)
+        let newRoot = appSupport.appendingPathComponent("Mila", isDirectory: true)
+        // Migration chain: prefer the newer IslandWhisper directory over the
+        // older IvritWhisper directory. Whichever exists first in this list
+        // wins — we never merge them, the user's most recent app's data is
+        // what they expect to see post-upgrade.
+        let legacyRoots = [
+            appSupport.appendingPathComponent("IslandWhisper", isDirectory: true),
+            appSupport.appendingPathComponent("IvritWhisper", isDirectory: true)
+        ]
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: newRoot.path),
+           let legacy = legacyRoots.first(where: { fm.fileExists(atPath: $0.path) }) {
+            do {
+                try fm.moveItem(at: legacy, to: newRoot)
+                // Deliberately `.public`, both paths and the error text. These
+                // are the fixed legacy app-support roots
+                // (`…/Application Support/IslandWhisper` or `…/IvritWhisper`)
+                // and the fixed new one (`…/Mila`) — this runs BEFORE any user
+                // storage override exists, and none of the three names can be
+                // anything the user chose. A once-per-upgrade migration that
+                // fails silently is unfixable by anyone; the paths are the
+                // report. (Issue #213.)
+                recStoreLog.log("""
+                    migrated \(legacy.path, privacy: .public) -> \
+                    \(newRoot.path, privacy: .public)
+                    """)
+            } catch {
+                recStoreLog.error("""
+                    migration from \(legacy.lastPathComponent, privacy: .public) failed \
+                    (\(error.localizedDescription, privacy: .public)) — falling back to fresh dir
+                    """)
+            }
+        }
+        self.init(rootDirectory: newRoot)
+        // The user override (if any) is applied by MilaApp after the
+        // store + the storage-settings instance it owns are both wired
+        // up — we don't observe the bookmark from inside the store so
+        // the test path (`init(rootDirectory:)`) stays cleanly isolated
+        // from UserDefaults.
+    }
+
+    /// Production-style init. `rootDirectory` is where the model cache
+    /// and the default recordings folder live. `customRecordingsDirectory`
+    /// is the user override — when non-nil, recordings + their json
+    /// sidecars live there instead of `<rootDirectory>/Recordings`.
+    /// Used by tests that need to verify the relocated-at-construction
+    /// path; production wires the override via `relocateRecordings(to:)`
+    /// from MilaApp.
+    convenience init(rootDirectory: URL, customRecordingsDirectory: URL?) {
+        self.init(rootDirectory: rootDirectory)
+        if let custom = customRecordingsDirectory {
+            relocateRecordings(to: custom)
+        }
+    }
+
+    /// Root passed into `init(rootDirectory:)`. Cached so
+    /// `relocateRecordings(to: nil)` can revert to the original
+    /// default-path layout (json files sit alongside the `Recordings/`
+    /// subdir, matching the historical shape that pre-v1.7 builds
+    /// shipped). Exposed (read-only) so app-state siblings that must NOT
+    /// travel with a relocated recordings folder — the store-location
+    /// pointer, the live-transcript sidecar — anchor to the same root,
+    /// keeping test instances (temp roots) isolated automatically.
+    let originalRootDirectory: URL
+
+    init(rootDirectory: URL) {
+        self.originalRootDirectory = rootDirectory
+        let defaultRecs = rootDirectory.appendingPathComponent("Recordings", isDirectory: true)
+        self.defaultRecordingsDirectory = defaultRecs
+        self.recordingsDirectory = defaultRecs
+        self.modelsDirectory = rootDirectory.appendingPathComponent("Models", isDirectory: true)
+        self.storeURL = rootDirectory.appendingPathComponent("recordings.json")
+        self.foldersURL = rootDirectory.appendingPathComponent("folders.json")
+        self.tombstonesURL = rootDirectory.appendingPathComponent("voicememo-tombstones.json")
+
+        try? fileManager.createDirectory(at: defaultRecs, withIntermediateDirectories: true)
+        try? fileManager.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
+        load()
+        loadFolders()
+        loadTombstones()
+        writeStoreLocationPointer()
+    }
+
+    /// Switch the recordings directory to `newDirectory`. Clears the
+    /// in-memory state and re-loads from the new location's
+    /// `recordings.json` + `folders.json` (if any). Existing recordings
+    /// at the old location stay on disk; this is intentionally a
+    /// "point at the new folder" operation, not a "move my data" one
+    /// — moving content is a separate action.
+    ///
+    /// Layout:
+    ///   * Default (newDirectory == nil): json files at
+    ///     `<originalRoot>/recordings.json` (sibling of the
+    ///     `Recordings/` subdir), wavs inside the subdir. Matches the
+    ///     historical layout.
+    ///   * Custom: json files at `<newDirectory>/recordings.json`,
+    ///     wavs in the same directory. Makes the chosen folder
+    ///     self-contained so the user can hand it to backup software
+    ///     / a cloud-sync app without picking up the model cache.
+    func relocateRecordings(to newDirectory: URL?) {
+        if let custom = newDirectory {
+            try? fileManager.createDirectory(at: custom, withIntermediateDirectories: true)
+            self.recordingsDirectory = custom
+            self.storeURL = custom.appendingPathComponent("recordings.json")
+            self.foldersURL = custom.appendingPathComponent("folders.json")
+        } else {
+            self.recordingsDirectory = defaultRecordingsDirectory
+            self.storeURL = originalRootDirectory.appendingPathComponent("recordings.json")
+            self.foldersURL = originalRootDirectory.appendingPathComponent("folders.json")
+            try? fileManager.createDirectory(at: defaultRecordingsDirectory, withIntermediateDirectories: true)
+        }
+        // Reset published state before reload so subscribers don't
+        // briefly see the old recordings under the new location label.
+        self.recordings = []
+        self.folders = []
+        self.pendingRecoveryIDs = []
+        load()
+        loadFolders()
+        writeStoreLocationPointer()
+    }
+
+    /// Whether `store-location.json` currently describes the store this
+    /// instance is actually reading and writing — i.e. whether mila-mcp
+    /// would land on the SAME store.
+    ///
+    /// `false` means the pointer is stale, and stale is dangerous rather
+    /// than merely unhelpful: `relocateRecordings` switches the live paths
+    /// before the pointer is written and deliberately leaves the old store
+    /// on disk, so a pointer that failed to update still resolves — to a
+    /// store the app has stopped writing to. The helper would answer from
+    /// recordings that stopped updating at the moment of relocation, with
+    /// nothing to tell anyone it happened. Answering nothing is strictly
+    /// better than answering confidently wrong, so `MCPAccessSettings`
+    /// treats this as "MCP access unavailable" and closes the on-disk gate
+    /// until a verified pointer exists.
+    ///
+    /// Not a permission or a preference: it is a readiness fact, recomputed
+    /// on every pointer write, and it converges on its own — `init` rewrites
+    /// the pointer on every launch, so a transient failure clears itself.
+    private(set) var storeLocationIsDiscoverable: Bool = true
+
+    /// Late-bound by `MilaApp` to `MCPAccessSettings.refreshMirror()`. Fires
+    /// only when `storeLocationIsDiscoverable` actually flips, so a normal
+    /// relocation — the overwhelmingly common case — never rewrites the gate
+    /// file. Not a `@Published` + Combine pair because `MilaApp.init` has no
+    /// cancellable bag to keep a subscription alive, and the one consumer
+    /// wants a callback rather than a value.
+    var onStoreLocationDiscoverabilityChanged: (() -> Void)?
+
+    /// Mirror the resolved store paths into `store-location.json` at the
+    /// original root so external tools (mila-mcp) can find the store even
+    /// when the user relocated the recordings directory — the relocation
+    /// itself lives in a security-scoped bookmark another process can't
+    /// resolve. Always written at the ORIGINAL root: on the default path
+    /// that's Application Support/Mila, and test instances (temp roots)
+    /// stay isolated automatically.
+    ///
+    /// The write is VERIFIED by reading back what an external reader would
+    /// now resolve, not by trusting `write()` to have thrown on failure.
+    /// The end state is what matters — see
+    /// `MilaStoreReader.resolvesActiveStore`.
+    private func writeStoreLocationPointer() {
+        let pointer = StoreLocationPointer(recordingsDirectory: recordingsDirectory.path,
+                                           storeFile: storeURL.path,
+                                           updatedAt: Date())
+        do {
+            try pointer.write(to: originalRootDirectory)
+        } catch {
+            // Deliberately still `.public`, and the only file-write path left
+            // that is. This writes to `originalRootDirectory`, a `let` set from
+            // `init(rootDirectory:)` that is NEVER the user's chosen storage
+            // folder: `relocateRecordings` moves `recordingsDirectory` /
+            // `storeURL` / `foldersURL` and leaves this untouched, and
+            // production always constructs `RecordingStore()`, i.e. the fixed
+            // app-support root. So the quoted path can only ever be
+            // “store-location.json” in the folder “Mila” — no user content, and
+            // a readable message is worth more here than a blanket redaction.
+            recStoreLog.error("failed to write store-location pointer: \(error.localizedDescription, privacy: .public)")
+        }
+        let discoverable = MilaStoreReader.resolvesActiveStore(
+            root: originalRootDirectory,
+            recordingsDirectory: recordingsDirectory,
+            storeFile: storeURL)
+        if !discoverable {
+            // Deliberately an error even though the app itself is fine: this
+            // is the only trace of a divergence that is otherwise invisible
+            // from inside Mila.
+            recStoreLog.error("""
+                store-location pointer does not describe the active store \
+                (external readers would resolve elsewhere) — MCP access \
+                stays closed until it can be written
+                """)
+        }
+        if storeLocationIsDiscoverable != discoverable {
+            storeLocationIsDiscoverable = discoverable
+            onStoreLocationDiscoverabilityChanged?()
+        }
+    }
+
+    func audioURL(for recording: Recording) -> URL {
+        recordingsDirectory.appendingPathComponent(recording.audioFileName)
+    }
+
+    /// Total bytes used by recording audio files on disk — drives the
+    /// storage cap (`RecordingStorageSettings.limitBytes`). Sums the audio
+    /// files of all known recordings (trashed included; they occupy disk
+    /// until purged). Sidecars (.txt/.srt/.json) are negligible and
+    /// omitted. Best-effort: unreadable files count as 0.
+    func currentUsageBytes() -> Int64 {
+        var total: Int64 = 0
+        for rec in recordings {
+            let url = audioURL(for: rec)
+            if let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize {
+                total += Int64(size)
+            }
+        }
+        return total
+    }
+
+    /// Recordings with a compression in flight — guards against two
+    /// `compressRecordingAudio` runs overlapping for the same id.
+    private var compressingIDs: Set<UUID> = []
+
+    /// Transcode a recording's WAV to AAC/.m4a, point the recording at the
+    /// smaller file, and delete the WAV. The audio base name is unchanged
+    /// (only `.wav`→`.m4a`), so the `.txt`/`.srt`/`.summary.txt` sidecars
+    /// (derived from the base) keep their names. No-op when the audio
+    /// isn't a WAV (already compressed / imported m4a) or is missing.
+    /// Best-effort: a failed encode leaves the WAV untouched.
+    func compressRecordingAudio(id: UUID) async {
+        guard let rec = recordings.first(where: { $0.id == id }) else { return }
+        // Only compress finished recordings. A .pending/.running recording
+        // is still being read by the transcription queue (whisper +
+        // diarizer subprocess) — transcoding + deleting its WAV mid-flight
+        // would break those reads.
+        guard rec.status == .completed else { return }
+        let src = audioURL(for: rec)
+        guard src.pathExtension.lowercased() == "wav",
+              FileManager.default.fileExists(atPath: src.path) else { return }
+        // Prevent two compressions of the SAME recording from overlapping
+        // (post-stop hook + the reclaim action, or duplicate completion
+        // tasks). check+insert is synchronous on the main actor before the
+        // first `await`, so it's atomic — otherwise the loser would delete
+        // the winner's freshly-written .m4a in its stale-metadata branch
+        // below, leaving the recording with no audio on disk.
+        // Nor overlap an "End Conversation Here" audio trim: this would read
+        // the untrimmed WAV and then swap the full-length audio back in. Not
+        // dropped, though — `trimAudio` re-runs it once the trim is done.
+        if trimmingAudioIDs.contains(id) {
+            compressionDeferredByTrim.insert(id)
+            return
+        }
+        guard !compressingIDs.contains(id) else { return }
+        compressingIDs.insert(id)
+        defer { compressingIDs.remove(id) }
+        let dstName = (rec.audioFileName as NSString).deletingPathExtension + ".m4a"
+        let dst = recordingsDirectory.appendingPathComponent(dstName)
+        do {
+            try await AudioCompressor.compress(wavURL: src, toM4A: dst)
+        } catch {
+            // The error string names the audio file, which is title-derived.
+            recStoreLog.error("compressRecordingAudio failed for \(id, privacy: .public): \(error.localizedDescription, privacy: .private)")
+            try? FileManager.default.removeItem(at: dst)  // don't leave a partial m4a
+            return
+        }
+        // Re-fetch by id: the recording may have been edited/removed during
+        // the (off-main) encode. Only swap if it's still the same WAV AND it's
+        // still `.completed`.
+        //
+        // The status re-check closes a race with re-transcription: the user can
+        // right-click "Re-transcribe" on a recording whose post-completion
+        // compression is still in flight. That re-enqueues it and the worker
+        // flips it back to `.running` (synchronously, before it reads the audio
+        // — see `TranscriptionService.process`). If we deleted the source WAV
+        // here while that pass is reading it, the re-transcribe would fail with
+        // "file not found" and the recording would be stuck `.failed` with the
+        // OLD transcript. By bailing when the status is no longer `.completed`,
+        // we leave the WAV untouched for the in-flight pass; that pass will
+        // re-spawn compression when it finishes.
+        guard let idx = recordings.firstIndex(where: { $0.id == id }),
+              recordings[idx].audioFileName == rec.audioFileName,
+              recordings[idx].status == .completed else {
+            try? FileManager.default.removeItem(at: dst)
+            return
+        }
+        recordings[idx].audioFileName = dstName
+        persist()
+        try? FileManager.default.removeItem(at: src)
+        recStoreLog.log("compressed recording \(id, privacy: .public) → \(dstName, privacy: .private)")
+    }
+
+    /// Number of finished recordings still stored as WAV (i.e. compressible).
+    /// Drives the "Compress existing recordings" affordance. Pending/running
+    /// recordings are excluded — their WAV is still being transcribed.
+    func wavRecordingCount() -> Int {
+        recordings.filter { $0.status == .completed && $0.audioFileName.lowercased().hasSuffix(".wav") }.count
+    }
+
+    /// Transcode every WAV recording to m4a — the one-time "reclaim space"
+    /// action. Sequential to bound CPU/memory. `onProgress(done, total)`
+    /// fires on the main actor after each. Returns the count converted.
+    @discardableResult
+    func compressAllWAVRecordings(onProgress: (@MainActor (Int, Int) -> Void)? = nil) async -> Int {
+        let wavIDs = recordings
+            .filter { $0.status == .completed && $0.audioFileName.lowercased().hasSuffix(".wav") }
+            .map(\.id)
+        for (i, id) in wavIDs.enumerated() {
+            await compressRecordingAudio(id: id)
+            onProgress?(i + 1, wavIDs.count)
+        }
+        return wavIDs.count
+    }
+
+    /// Path of the per-recording `.txt` transcript sidecar. The file may not
+    /// exist yet (recording still pending) — callers should treat absence as
+    /// empty text.
+    func transcriptURL(for recording: Recording) -> URL {
+        recordingsDirectory.appendingPathComponent(recording.transcriptFileName)
+    }
+
+    /// Path of the per-recording `.summary.txt` sidecar holding the
+    /// LLM-generated summary. Absent on disk whenever `recording.summary`
+    /// is nil/empty — `writeSummary(for:)` removes the file in that case
+    /// so an old summary doesn't outlive being cleared.
+    func summaryURL(for recording: Recording) -> URL {
+        recordingsDirectory.appendingPathComponent(recording.summaryFileName)
+    }
+
+    /// Path of the per-recording `.srt` subtitle sidecar auto-written after
+    /// transcription. May be absent (recording still pending, or it had no
+    /// segments) — callers should treat absence as "nothing to remove".
+    func subtitleURL(for recording: Recording) -> URL {
+        recordingsDirectory.appendingPathComponent(recording.subtitleFileName)
+    }
+
+    func freshAudioURL(suggestedName: String? = nil) -> URL {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        let suffix = String(UUID().uuidString.prefix(6))
+        let base = (suggestedName?.isEmpty == false ? suggestedName! : "Recording")
+            + " " + stamp + "-" + suffix
+        return recordingsDirectory.appendingPathComponent(base + ".wav")
+    }
+
+    func add(_ recording: Recording) {
+        recordings.insert(recording, at: 0)
+        writeTranscript(for: recording)
+        writeSummary(for: recording)
+        persist()
+    }
+
+    /// Returns whether the record a SEPARATE PROCESS would now read matches
+    /// what was just written — i.e. both the `.txt` transcript sidecar and
+    /// `recordings.json` landed on disk.
+    ///
+    /// Callers that merely mutate in-memory state can keep ignoring the
+    /// result (hence `@discardableResult`). The one caller that must not is
+    /// `QuickActionsController.stopRecording`, which publishes the live
+    /// sidecar's `completed` + `final_recording_id` handoff: that pair
+    /// promises an external reader that following the id yields the final
+    /// transcript, and `MilaStoreReader.transcriptText` reads the `.txt`
+    /// sidecar FIRST. A suppressed write error there means the handoff points
+    /// at a stale sidecar. Both writes used to fail silently — `print` and
+    /// carry on. (CodeRabbit on #183.)
+    ///
+    /// `writeSummary` is deliberately not part of the verdict: the summary
+    /// also lives in `recordings.json`, so its sidecar is an extra surface
+    /// rather than the source of truth.
+    @discardableResult
+    func update(_ recording: Recording) -> Bool {
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return false }
+        recordings[idx] = recording
+        let transcriptWritten = writeTranscript(for: recording)
+        writeSummary(for: recording)
+        let persisted = persist()
+        return transcriptWritten && persisted
+    }
+
+    /// Insert a recording that arrived from elsewhere (a `.milashare`
+    /// import), or replace the one that already carries its id.
+    ///
+    /// Neither `add` nor `update` fits on its own: `add` always inserts at
+    /// index 0 — right for a recording made just now, wrong for a three-week-
+    /// old meeting a colleague shared, which would sit at the top of the list
+    /// until the next relaunch re-sorted it — and cannot replace, while
+    /// `update` cannot insert. More importantly, `add` would happily insert a
+    /// SECOND record with the same id, and every lookup here is
+    /// `firstIndex(where: id ==)`, so the duplicate would shadow the original
+    /// for ever after. This is the one entry point that guarantees a given
+    /// UUID appears at most once.
+    ///
+    /// What `upsertImported` did. Unlike `update(_:)`'s Bool, this separates
+    /// "nothing changed" from "saved, but the transcript sidecar didn't
+    /// land", because the caller owns an audio file whose fate depends on
+    /// the difference: after `.notSaved` the file is unreferenced and should
+    /// go; after `.savedWithoutTranscript` the library points at it and
+    /// deleting it would leave a row with no audio.
+    enum UpsertOutcome: Equatable {
+        /// Row in `recordings.json`, `.txt` sidecar on disk.
+        case saved
+        /// Row in `recordings.json`, but the `.txt` write failed. `load()`
+        /// falls back to the segments' text, so the recording stays usable.
+        case savedWithoutTranscript
+        /// `recordings.json` could not be written. The in-memory list and
+        /// the sidecars are rolled back, so the store is exactly as before.
+        case notSaved
+    }
+
+    /// `recordings.json` is the commit point: the in-memory mutation and the
+    /// sidecars are rolled back when it cannot be written, so a `.notSaved`
+    /// outcome leaves no trace of the attempt.
+    @discardableResult
+    func upsertImported(_ recording: Recording) -> UpsertOutcome {
+        let before = recordings
+        if let idx = recordings.firstIndex(where: { $0.id == recording.id }) {
+            recordings[idx] = recording
+        } else {
+            // The list is kept newest-first (see `load`); slot the newcomer
+            // where its own creation date says it belongs.
+            let idx = recordings.firstIndex { $0.createdAt <= recording.createdAt } ?? recordings.count
+            recordings.insert(recording, at: idx)
+        }
+        let transcriptWritten = writeTranscript(for: recording)
+        writeSummary(for: recording)
+        guard persist() else {
+            recordings = before
+            // The imported recording's sidecars derive from a freshly minted
+            // audio name, so they are new files and removing them cannot
+            // touch anything the previous row owned.
+            try? fileManager.removeItem(at: transcriptURL(for: recording))
+            try? fileManager.removeItem(at: summaryURL(for: recording))
+            return .notSaved
+        }
+        return transcriptWritten ? .saved : .savedWithoutTranscript
+    }
+
+    /// `update(_:)` plus the one piece of bookkeeping a caller owes when it
+    /// replaces a recording's **whole** `speakerNames` map because a pass
+    /// re-keyed its `SPEAKER_NN` ids: `onSpeakerUnnamed` fires for every
+    /// `[oldID: previousName]` pair in `retired`, so the voice-profile
+    /// contribution each of those names justified is subtracted back out.
+    ///
+    /// Without it, a name the re-key drops takes its label away and leaves
+    /// its observation folded into that profile with nothing left to un-name
+    /// — #237's correction is unreachable for it, permanently
+    /// (island-io/mila#254).
+    ///
+    /// **One caller, deliberately.** Two paths replace the map wholesale. The
+    /// offline re-diarize remap
+    /// (`QuickActionsController.applyRediarizedSpeakers`) comes through here.
+    /// The batch pass's clear (`TranscriptionService.mergePassResult`) does
+    /// NOT, and it is not an oversight: `OfflineVoiceEmbedder.matchAfterPass`
+    /// runs immediately after that write, re-embeds every speaker and
+    /// re-matches them against the stored profiles — so a retire there would
+    /// subtract the weight the re-match is about to look the speaker up by,
+    /// and a profile whose only content came from that recording would be
+    /// deleted before the pass could restore its name. The re-diarize path
+    /// has no re-match behind it, since it carries the names rather than
+    /// re-deriving them.
+    ///
+    /// **That still holds after island-io/mila#260 closed the other half.**
+    /// The re-transcribe path fixes its stranding from the *naming* side
+    /// instead: when the re-match brings a pre-pass name back,
+    /// `matchAfterPass` re-attaches the label to the contribution the profile
+    /// already holds (`reattachSpeakerName`) rather than folding a second one
+    /// in, and it subtracts nothing at any point. A name the re-match does
+    /// NOT bring back is left as residue, on purpose — retiring it here would
+    /// delete a profile whose only weight came from this recording, on the
+    /// evidence of a failed voice match rather than a user's correction.
+    ///
+    /// **The one destructive case, and why it is left exact.** A retire
+    /// subtracts exactly what naming that id added, so a profile holding
+    /// nothing else reaches zero and `SpeakerProfileStore` removes it — which
+    /// is also precisely what un-naming that speaker by hand does today. It
+    /// is bounded to that: a profile carrying weight from any other recording
+    /// keeps it, so no other recording's contribution is ever touched, and
+    /// every profile seeded from a stored one survives by construction (it
+    /// had weight before this recording could add any). Clamping instead
+    /// would keep a name→voice mapping the pass has just contradicted — the
+    /// retired fragment's audio is now another speaker's — and would need a
+    /// second, quieter correction policy beside this hook.
+    /// `SpeakerCorrectionActionsTests.test_retiring_the_only_contribution_a_profile_ever_had_removes_it`
+    /// pins it so the trade is reviewable rather than incidental.
+    ///
+    /// **Call this BEFORE the observations are re-keyed.** The hook resolves
+    /// `rawID` through `ObservedVoiceSnapshots`, which is still keyed to the
+    /// ids these names were attached to; after the re-key `SPEAKER_00` is a
+    /// different voice and the subtraction would take the wrong embedding out
+    /// of the profile.
+    ///
+    /// **Why `retired` is caller-supplied instead of `update(_:)` diffing the
+    /// map.** Because a re-key changes what the KEYS mean, so no key-by-key
+    /// diff can be right. Take old `{00: Bob, 01: Alice}` becoming
+    /// `{00: Alice}` — new 00 is old 01's voice. A diff sees `00` change
+    /// `Bob → Alice` and `01` disappear, so it would fire
+    /// `onSpeakerNamed(00, "Alice")`, folding old 00's embedding (Bob's, since
+    /// the snapshot has not been re-keyed yet) into Alice's profile, and
+    /// `onSpeakerUnnamed(01, "Alice")`, taking back a contribution Alice
+    /// legitimately still holds — which then gets subtracted a second time
+    /// when the user un-names her, out of her other recordings. The pairing
+    /// of a name with the observation backing it, not the key it happens to
+    /// sit under, is the identity that matters; `SpeakerNameRemapper` is where
+    /// the mapping that establishes it lives, so that is where the retired
+    /// set is computed (`retiredNames`).
+    ///
+    /// **Only the retiring direction fires.** A re-key never *adds* a name: a
+    /// carried name is the same string its dominant old id already had, and
+    /// the observation moves onto the same new id, so the pair arrives intact
+    /// and firing `onSpeakerNamed` for it would double-count. Every genuinely
+    /// new name still comes through `setSpeakerName`, which fires the hooks
+    /// itself and does not route through `update(_:)` — so nothing here can
+    /// double-fire against it.
+    ///
+    /// The hooks run after the write, and nothing is read out of `recordings`
+    /// afterwards: a hook is caller-supplied code and may mutate the store,
+    /// which would invalidate an index held across it (the trap
+    /// `mergeSpeakers` documents). They run whether or not the write reached
+    /// disk, because `update(_:)` has already replaced the in-memory row —
+    /// skipping them would leave the profiles describing names the app no
+    /// longer shows.
+    @discardableResult
+    func update(_ recording: Recording,
+                retiringSpeakerNames retired: [String: String]) -> Bool {
+        // No row means the recording left the store mid-pass (hard-deleted,
+        // trash emptied). `update` writes nothing in that case, so this must
+        // not correct profiles for a change that did not happen.
+        guard recordings.contains(where: { $0.id == recording.id }) else { return false }
+        let persisted = update(recording)
+        // Sorted: `Dictionary` iteration order is unspecified per process and
+        // each of these can rewrite a profile on disk.
+        for (rawID, previousName) in retired.sorted(by: { $0.key < $1.key }) {
+            onSpeakerUnnamed?(recording.id, rawID, previousName)
+        }
+        return persisted
+    }
+
+    /// Replace several stored records in one pass with a SINGLE persist, vs.
+    /// `update(_:)`'s one full-file rewrite per call. Used by the launch
+    /// crash-recovery sweep, which can flip many stale rows at once (a large
+    /// synced library can leave dozens of `.pending` rows). This is a
+    /// status/metadata bulk update — transcript/summary sidecars are left
+    /// as-is (recovery doesn't change their content). Unknown ids are skipped;
+    /// persists only if something actually changed.
+    ///
+    /// Deliberately fires no speaker hooks, unlike
+    /// `update(_:retiringSpeakerNames:)`: its callers copy live rows and
+    /// change `status`, and the launch sweep in particular runs before any
+    /// recording has been observed, so a name arriving through it has no
+    /// observation to reconcile — while `onSpeakerNamed` there would kick off
+    /// an on-demand embedding subprocess per row. A caller that ever needs to
+    /// move `speakerNames` in bulk must use the single-row method instead.
+    func updateAll(_ updated: [Recording]) {
+        var touched = false
+        for recording in updated {
+            guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { continue }
+            recordings[idx] = recording
+            touched = true
+        }
+        if touched { persist() }
+    }
+
+    /// Flip a recording into `.pending` (optionally switching its transcription
+    /// `language`) and return the CURRENT store record, ready to hand to
+    /// `TranscriptionService.enqueue`.
+    ///
+    /// Why this exists instead of the callers doing `var copy = recording;
+    /// copy.language = …; store.update(copy)`: the `recording` a SwiftUI
+    /// context menu has captured can be a STALE snapshot. In particular its
+    /// `audioFileName` may still be the original `.wav` even though the
+    /// post-completion compression has since renamed the file to `.m4a` and
+    /// deleted the WAV. `update`-ing that stale copy would clobber the store's
+    /// correct `.m4a` name back to the dead `.wav`, and the re-transcribe pass
+    /// would then fail with "file not found" — landing `.failed` with the OLD
+    /// transcript still showing. (This was a flaky-CI / real-world re-transcribe
+    /// bug.) By mutating ONLY `language` + `status` on the live record we keep
+    /// the store-owned `audioFileName` intact. Returns nil if the recording is
+    /// gone.
+    func prepareForRetranscription(id: UUID, language: String? = nil) -> Recording? {
+        // Not while "End Conversation Here" is still cutting this recording's
+        // audio (#357): the trim would give up on a `.pending` row and the
+        // pass would transcribe the FULL audio, writing the lines the user
+        // just removed straight back. Every UI entry point is disabled in
+        // that window; this is the chokepoint behind them.
+        guard !audioTrimPendingIDs.contains(id) else {
+            recStoreLog.log("re-transcription of \(id, privacy: .public) refused — an audio trim is in flight")
+            return nil
+        }
+        guard let idx = recordings.firstIndex(where: { $0.id == id }) else { return nil }
+        let before = recordings[idx]
+        // Remember what the kept transcript looked like, so a stop
+        // (`markTranscriptionDeferred`) undoes the re-run exactly: the
+        // transcript goes back to the status, language and model that
+        // describe it, not the ones of the run that never happened (a stopped
+        // "Re-transcribe in Hebrew" must not leave English text labelled
+        // Hebrew). On the row — persisted — because the re-run may be stopped
+        // only after a relaunch, from a process that never saw this call
+        // (`Recording.retranscriptionPriorState`, island-io/mila#320).
+        //
+        // Captured only from a settled row: `.pending`/`.running` describe a
+        // run, not the transcript, and a row already in flight (the UI never
+        // offers Re-transcribe on one) keeps whatever it holds.
+        if before.status == .completed || before.status == .failed {
+            recordings[idx].retranscriptionPriorState = before.hasTranscript
+                ? .init(status: before.status,
+                        language: before.language,
+                        modelName: before.modelName,
+                        transcriptionDeferredAt: before.transcriptionDeferredAt)
+                : nil
+        }
+        if let language { recordings[idx].language = language }
+        recordings[idx].status = .pending
+        // The user is starting the run they earlier put off.
+        recordings[idx].transcriptionDeferredAt = nil
+        persist()
+        return recordings[idx]
+    }
+
+    /// Rename a recording's user-facing title. No-op if the trimmed title is
+    /// empty (we never want a blank entry in the sidebar) or unchanged.
+    func rename(_ recording: Recording, to newTitle: String) {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
+        guard recordings[idx].title != trimmed else { return }
+        recordings[idx].title = trimmed
+        persist()
+    }
+
+    /// Set (or clear, with nil) the per-recording summary language override
+    /// — see `Recording.summaryLanguage`. Mutates ONLY that field on the
+    /// LIVE row and returns it, ready to hand to
+    /// `RecordingSummarizer.regenerate`. Returns nil if the recording is gone.
+    ///
+    /// Same shape as `prepareForRetranscription`, for the same reason: the
+    /// `Recording` a context menu captured can be a stale snapshot whose
+    /// `audioFileName` still says `.wav` after the post-completion
+    /// compression renamed the file to `.m4a`. `store.update(copy)` from
+    /// such a snapshot would clobber the live `.m4a` name back to a deleted
+    /// file. Writing one field on the live row sidesteps that entirely.
+    ///
+    /// Persists unconditionally; whether a pick is actually a change is the
+    /// one caller's call — `RecordingSummarizer.setSummaryLanguage` skips
+    /// both the write and the regenerate when it is not.
+    @discardableResult
+    func setSummaryLanguage(_ code: String?, recordingID: UUID) -> Recording? {
+        guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return nil }
+        recordings[idx].summaryLanguage = code
+        persist()
+        return recordings[idx]
+    }
+
+    /// Assign (or clear, with nil/empty) a display name for one raw
+    /// diarizer speaker ID on a recording. Segments keep their raw
+    /// `SPEAKER_NN` IDs — the name is a display overlay resolved at
+    /// render/export time. Regenerates the `.srt` sidecar for completed
+    /// recordings so the on-disk export matches what the UI shows.
+    ///
+    /// **A pure label write.** It never moves a segment between speakers.
+    /// An earlier revision merged automatically when the typed name matched
+    /// another speaker's, which read well from the popover and was a trap
+    /// everywhere else: `RecognisedSpeakerAssigner` and the post-pass
+    /// auto-match both loop over `setSpeakerName`, and two clusters matching
+    /// one stored profile — two similar voices, one threshold — silently
+    /// collapsed into one speaker with no user action, no confirmation and
+    /// no undo. Which of the two survived was not even stable, since the
+    /// embeddings arrive in a `Dictionary`. Merging is destructive, so it is
+    /// a deliberate user action: `mergeSpeakers`, reached from the speaker
+    /// popover behind a confirmation (island-io/mila#237).
+    func setSpeakerName(_ name: String?, forSpeaker rawID: String, recordingID: UUID) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return }
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmed, !trimmed.isEmpty {
+            guard recordings[idx].speakerNames[rawID] != trimmed else { return }
+            let previousName = recordings[idx].speakerNames[rawID]
+            recordings[idx].speakerNames[rawID] = trimmed
+            // Renaming: subtract from old profile before merging into new.
+            if let previousName {
+                onSpeakerUnnamed?(recordingID, rawID, previousName)
+            }
+            onSpeakerNamed?(recordingID, rawID, trimmed)
+        } else {
+            guard let previousName = recordings[idx].speakerNames[rawID] else { return }
+            recordings[idx].speakerNames.removeValue(forKey: rawID)
+            onSpeakerUnnamed?(recordingID, rawID, previousName)
+        }
+        // Whatever was suggested for this speaker is settled by an explicit
+        // name either way: accepted, overruled, or the user resetting to the
+        // default label — which must not resurrect a suggestion they already
+        // looked past. Re-resolved by id: the hooks above ran caller code.
+        if let i = recordings.firstIndex(where: { $0.id == recordingID }) {
+            recordings[i].speakerNameSuggestions.removeAll { $0.speaker == rawID }
+        }
+        persist()
+        if recordings[idx].status == .completed {
+            TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
+        }
+    }
+
+    // MARK: - Speaker name suggestions (issue #348)
+
+    /// Add `suggestions` to a recording's pending speaker-name suggestions,
+    /// replacing any existing suggestion for the same speaker. Returns whether
+    /// anything changed (and was persisted).
+    ///
+    /// Only suggestions that can still be acted on are kept — the speaker has
+    /// lines in the transcript and no name yet — so a name that landed from
+    /// another path while the suggestion was being produced wins. Writes ONE
+    /// field on the LIVE row, never a caller's snapshot, for the same reason
+    /// `setSummaryLanguage` does.
+    ///
+    /// This never names anyone. Accepting is `acceptSpeakerNameSuggestion`.
+    @discardableResult
+    func mergeSpeakerNameSuggestions(_ suggestions: [SpeakerNameSuggestion],
+                                     recordingID: UUID) -> Bool {
+        guard !suggestions.isEmpty,
+              let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return false }
+        let row = recordings[idx]
+        var merged = row.speakerNameSuggestions
+        // Same rule the UI filters on (`actionableSpeakerNameSuggestions`),
+        // from the one place it is defined.
+        for suggestion in suggestions where row.acceptsSpeakerNameSuggestion(for: suggestion.speaker) {
+            if let existing = merged.firstIndex(where: { $0.speaker == suggestion.speaker }) {
+                merged[existing] = suggestion
+            } else {
+                merged.append(suggestion)
+            }
+        }
+        guard merged != row.speakerNameSuggestions else { return false }
+        recordings[idx].speakerNameSuggestions = merged
+        persist()
+        return true
+    }
+
+    /// Drop the pending suggestion for `rawID` without naming anyone — the
+    /// user's "no, that's not them". No-op when there is none.
+    func dismissSpeakerNameSuggestion(forSpeaker rawID: String, recordingID: UUID) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return }
+        let before = recordings[idx].speakerNameSuggestions.count
+        recordings[idx].speakerNameSuggestions.removeAll { $0.speaker == rawID }
+        guard recordings[idx].speakerNameSuggestions.count != before else { return }
+        persist()
+    }
+
+    /// Accept the pending suggestion for `rawID`: name the speaker through
+    /// `setSpeakerName` — the normal rename path, so the voice-profile hooks
+    /// fire exactly as they do for a name the user typed — and drop the
+    /// suggestion. Returns the name assigned, or nil when there was nothing
+    /// to accept (no suggestion, the speaker has gone, or it was named
+    /// meanwhile — an existing name is never replaced from here).
+    ///
+    /// `canonicalName` lets the caller route the name through the
+    /// `SpeakerDirectory` exactly as the rename popover does
+    /// (`directory.add`), so an accepted "dana" lands as the "Dana" the user
+    /// already has and appears in future pick-lists. Returning nil from it
+    /// cancels the accept.
+    @discardableResult
+    func acceptSpeakerNameSuggestion(forSpeaker rawID: String,
+                                     recordingID: UUID,
+                                     canonicalName: (String) -> String? = { $0 }) -> String? {
+        guard let row = recordings.first(where: { $0.id == recordingID }),
+              let suggestion = row.actionableSpeakerNameSuggestions
+                .first(where: { $0.speaker == rawID }),
+              let name = canonicalName(suggestion.name)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty
+        else { return nil }
+        // Removes the suggestion too (see the tail of `setSpeakerName`).
+        setSpeakerName(name, forSpeaker: rawID, recordingID: recordingID)
+        return name
+    }
+
+    /// Put a name back on a raw id a pass re-keyed, **without firing
+    /// `onSpeakerNamed`** — because the profile named here already holds this
+    /// recording's contribution, and folding a second one in is the bug this
+    /// exists to stop (island-io/mila#260).
+    ///
+    /// **The situation.** A batch pass re-keys every `SPEAKER_NN`, so
+    /// `TranscriptionService` clears `speakerNames` wholesale. The profile
+    /// contributions those names justified stay on disk, keyed to nothing.
+    /// `OfflineVoiceEmbedder.matchAfterPass` then re-embeds every speaker and
+    /// re-matches them against the stored profiles *by voice*; when a name
+    /// this recording carried BEFORE the pass comes back that way, the right
+    /// answer is to re-attach the label to the contribution that is already
+    /// there — not to add another one beside it. Going through
+    /// `setSpeakerName` would fold the fresh observation in on top, leaving
+    /// the profile holding two observations of one recording, one of them
+    /// permanently unreachable. So this is the label half only; the embedder
+    /// owns the observation half (it re-points the snapshot entry at the
+    /// contribution the profile actually received) and the two are called
+    /// together.
+    ///
+    /// **Not a general "quiet setter".** It refuses to touch an id that
+    /// already carries a name, so it can never silently replace one — a
+    /// replacement is a profile correction and belongs on `setSpeakerName`,
+    /// which fires both hooks. And it is only correct where the caller has
+    /// both established that the profile already carries this recording's
+    /// contribution under `name` **and** pointed the snapshot for `rawID` at
+    /// that same contribution. Suppressing the fold without re-pointing
+    /// leaves the snapshot describing an observation the profile never
+    /// received, and the un-name then subtracts a vector that was never
+    /// added — a drifted centroid, worse than the duplicate fold it avoids.
+    /// A caller that cannot do both must use `setSpeakerName`. There is
+    /// exactly one such caller; `OfflineVoiceEmbedderTests` pins both halves,
+    /// including the fall-through.
+    ///
+    /// The **other** direction — a name a re-key drops for good — is
+    /// `update(_:retiringSpeakerNames:)`, which fires `onSpeakerUnnamed` so
+    /// the contribution comes back out. Deliberately not used on the
+    /// re-transcribe path: see that method's note and #260.
+    func reattachSpeakerName(_ name: String, toSpeaker rawID: String, recordingID: UUID) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        // Never over-write. An id that already has a name has one because
+        // something else set it — the user typing while the pass ran, most
+        // likely — and replacing it here would drop that name with no
+        // `onSpeakerUnnamed` to correct the profile it went into.
+        guard recordings[idx].speakerNames[rawID] == nil else { return }
+        recordings[idx].speakerNames[rawID] = trimmed
+        persist()
+        if recordings[idx].status == .completed {
+            TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
+        }
+    }
+
+    /// Merge all segments of one speaker into another within a recording:
+    /// the diarizer split one person in two and the user is putting them
+    /// back together. Destructive and not undoable, so every caller is a
+    /// confirmed user action — see the note on `setSpeakerName`.
+    ///
+    /// The voice bookkeeping matters as much as the segments. The source
+    /// id's observed embedding was folded into the source's profile when it
+    /// was named; the merge is the user saying that observation belongs to
+    /// the *target* person instead. So it is subtracted from the old profile
+    /// and added to the target's — the same subtract-then-add the rename
+    /// branch of `setSpeakerName` does, and it resolves correctly because
+    /// the snapshot is still keyed to the source raw id at this point.
+    /// Landing only the subtraction (which is what the auto-merge did) left
+    /// the observation nowhere: the wrong profile lost it and the right one
+    /// never gained it.
+    func mergeSpeakers(from sourceRawID: String, into targetRawID: String, recordingID: UUID) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recordingID }),
+              sourceRawID != targetRawID else { return }
+        for i in recordings[idx].segments.indices {
+            if recordings[idx].segments[i].speaker == sourceRawID {
+                recordings[idx].segments[i].speaker = targetRawID
+            }
+        }
+        retireSpeaker(sourceRawID, into: targetRawID, at: idx, recordingID: recordingID)
+        persist()
+        // Re-resolve: `retireSpeaker` ran caller-supplied hooks, and an index
+        // held across a callback is only valid while nothing reorders or
+        // removes a row. Nothing wired today does, which is exactly why this
+        // would be found the hard way.
+        writeSRTIfCompleted(recordingID)
+    }
+
+    /// Move one segment to a different speaker already present in the
+    /// recording — the diarizer mis-tagged a single line and the user is
+    /// putting it where it belongs, without re-transcribing.
+    ///
+    /// Non-destructive on its own, but it can empty a speaker out: moving
+    /// the *last* segment of `SPEAKER_01` away retires that id, so its name
+    /// and its embedding go with it.
+    func reassignSegmentSpeaker(segmentID: UUID, toSpeaker targetRawID: String, recordingID: UUID) {
+        guard let recIdx = recordings.firstIndex(where: { $0.id == recordingID }),
+              let segIdx = recordings[recIdx].segments.firstIndex(where: { $0.id == segmentID })
+        else { return }
+        let previousSpeaker = recordings[recIdx].segments[segIdx].speaker
+        guard previousSpeaker != targetRawID else { return }
+        recordings[recIdx].segments[segIdx].speaker = targetRawID
+        if let prev = previousSpeaker,
+           !recordings[recIdx].segments.contains(where: { $0.speaker == prev }) {
+            // That was `prev`'s last line, so everything that was `prev` is
+            // now the target — the same thing a merge does, and it gets the
+            // same bookkeeping.
+            retireSpeaker(prev, into: targetRawID, at: recIdx, recordingID: recordingID)
+        }
+        persist()
+        writeSRTIfCompleted(recordingID)
+    }
+
+    /// Regenerate the `.srt` sidecar for a completed recording, resolving the
+    /// row by id. Used where a callback may have run since the index was
+    /// taken.
+    private func writeSRTIfCompleted(_ recordingID: UUID) {
+        guard let recording = recordings.first(where: { $0.id == recordingID }),
+              recording.status == .completed else { return }
+        TranscriptExporter.writeSRT(for: recording, in: recordingsDirectory)
+    }
+
+    /// One raw speaker id's audio has become another's. Move the name, the
+    /// profile contribution and the observed embedding together.
+    ///
+    /// **The three have to move as one operation.** A profile's accumulated
+    /// weight is only reversible while it stays reconstructible from the
+    /// snapshots backing it — `subtractObservation` is an exact inverse of
+    /// `updateProfile`'s weighted fold, and nothing else. Moving the profile
+    /// contribution without the snapshot leaves the target holding weight its
+    /// snapshot cannot account for, so a later un-name takes back only part
+    /// of what this recording added and strands the rest. Moving the snapshot
+    /// without the contribution strands it the other way. Both bugs were
+    /// reachable when the merge and reassign paths each did their own half.
+    private func retireSpeaker(_ sourceRawID: String,
+                               into targetRawID: String,
+                               at idx: Int,
+                               recordingID: UUID) {
+        // A pending name suggestion for the retired id goes with it. Left
+        // behind, it would resurface on whatever voice `splitSegmentSpeaker`
+        // next hands this number to (#348).
+        recordings[idx].speakerNameSuggestions.removeAll { $0.speaker == sourceRawID }
+        let previousName = recordings[idx].speakerNames.removeValue(forKey: sourceRawID)
+        let targetName = recordings[idx].speakerNames[targetRawID]
+        // Same name on both sides (the shape the old auto-merge always had):
+        // subtracting and re-adding the identical observation is a no-op on
+        // the centroid but not on `sampleCount` — a profile sitting at one
+        // sample would be *deleted* by the subtraction and then recreated,
+        // losing its id and its history. Skip both halves; the snapshot
+        // absorb below still runs, and it is what keeps the ledger matching
+        // the two contributions the profile already received.
+        if previousName != targetName {
+            if let previousName {
+                onSpeakerUnnamed?(recordingID, sourceRawID, previousName)
+            }
+            if let targetName {
+                onSpeakerNamed?(recordingID, sourceRawID, targetName)
+            }
+        }
+        // Last, because both hooks above still resolve through the source's
+        // own snapshot entry.
+        onSpeakerIDAbsorbed?(recordingID, sourceRawID, targetRawID)
+    }
+
+    /// Split a single segment out into a new, unnamed speaker: the diarizer
+    /// folded two people into one cluster and this line belongs to the other
+    /// one. The user names the new speaker through the normal popover, or
+    /// merges it into an existing speaker.
+    ///
+    /// **The new id must not be one the recording has used.** `used` spans
+    /// the segments *and* `speakerNames`, because a name outlives its
+    /// segments: name `SPEAKER_01` "Bob", split his only line away, and
+    /// `SPEAKER_01` carries no segment while `speakerNames["SPEAKER_01"]`
+    /// still says Bob — hand that number to the next split and the new line
+    /// renders as Bob, in the transcript and in the regenerated `.srt`.
+    /// Embeddings are kept out of the same trap by `onSpeakerIDAbsorbed`,
+    /// which drops a retired id's observation rather than leaving it for a
+    /// reused number to resolve against.
+    func splitSegmentSpeaker(segmentID: UUID, recordingID: UUID) {
+        guard let recIdx = recordings.firstIndex(where: { $0.id == recordingID }),
+              let segIdx = recordings[recIdx].segments.firstIndex(where: { $0.id == segmentID }),
+              let current = recordings[recIdx].segments[segIdx].speaker
+        else { return }
+        // Splitting a speaker's ONLY line just renames its id: same one
+        // segment, same one speaker, but the old id is stranded (with its
+        // name, and its embedding) for no gain. Nothing to do.
+        guard recordings[recIdx].segments.contains(where: { $0.id != segmentID && $0.speaker == current })
+        else { return }
+        var used = Set(recordings[recIdx].segments.compactMap(\.speaker))
+        used.formUnion(recordings[recIdx].speakerNames.keys)
+        // Same reason as the names: a pending suggestion keyed to a number
+        // must never attach to the new, unrelated voice (#348).
+        used.formUnion(recordings[recIdx].speakerNameSuggestions.map(\.speaker))
+        var next = 0
+        while used.contains(String(format: "SPEAKER_%02d", next)) { next += 1 }
+        let newRawID = String(format: "SPEAKER_%02d", next)
+        recordings[recIdx].segments[segIdx].speaker = newRawID
+        persist()
+        if recordings[recIdx].status == .completed {
+            TranscriptExporter.writeSRT(for: recordings[recIdx], in: recordingsDirectory)
+        }
+    }
+
+    // MARK: - Transcript trimming (island-io/mila#357)
+
+    /// Whether the user may cut lines out of `recording`'s transcript now.
+    /// Not while a transcription pass is queued or running: that pass writes
+    /// its own segments back when it finishes, which would silently undo the
+    /// edit — and an "End Conversation Here" audio trim must not swap the
+    /// file out from under a pass that is reading it.
+    nonisolated static func canEditTranscript(_ recording: Recording) -> Bool {
+        recording.status != .pending && recording.status != .running
+            && !recording.segments.isEmpty
+    }
+
+    /// A "not now" for transcript edits that the row itself cannot show.
+    /// Wired in `MilaApp` to `TranscriptionService.isAwaitingSpeakerFinalization`:
+    /// after a live recording stops, `QuickActionsController.finalizeTail`
+    /// re-diarizes a stop-time COPY of the segments while the row already
+    /// reads `.completed`, then writes that copy back
+    /// (`applyRediarizedSpeakers`) along with an `.srt` — so lines deleted in
+    /// that window would come straight back. nil (tests, previews) blocks
+    /// nothing.
+    var isTranscriptEditBlocked: ((UUID) -> Bool)?
+
+    /// `canEditTranscript` plus the out-of-row blocker above. What both the
+    /// store's own guards and the detail view consult.
+    func canEditTranscriptNow(_ recording: Recording) -> Bool {
+        Self.canEditTranscript(recording) && !(isTranscriptEditBlocked?(recording.id) ?? false)
+    }
+
+    /// Remove the lines `segmentIDs` from a recording's transcript. Returns
+    /// the updated row, or nil when nothing changed (unknown recording, a
+    /// pass in flight, no matching line, or an edit that would empty the
+    /// transcript — see `Recording.removingSegments`), and also when
+    /// recordings.json could not be saved (`trimNotice` then says so).
+    ///
+    /// The audio is kept, so a later re-transcription brings the lines back;
+    /// the confirmation in the detail view says so.
+    @discardableResult
+    func deleteSegments(_ segmentIDs: Set<UUID>, recordingID: UUID) -> Recording? {
+        applyTranscriptEdit(recordingID: recordingID) { $0.removingSegments(segmentIDs) }
+    }
+
+    /// What "End Conversation Here" did: the row after the transcript edit
+    /// (and the audio trim, when one happened), and what became of the audio.
+    struct EndConversationResult {
+        let recording: Recording
+        let audio: AudioTrimOutcome
+    }
+
+    /// Remove every line after `segmentID` and cut the audio just past it
+    /// (`TranscriptTrim.audioCutTime`). The transcript edit lands before the
+    /// first suspension point, so the row and its sidecars are trimmed before
+    /// the audio work starts. A failed or skipped audio trim leaves the
+    /// original audio untouched — the transcript edit stands either way — and
+    /// is reported both in `audio` and through `trimNotice`, which the
+    /// main window shows even if the user has navigated away by then.
+    ///
+    /// Returns nil when the transcript edit did not happen (unknown
+    /// recording or line, the last line, or an edit that is blocked now).
+    @discardableResult
+    func endConversation(afterSegment segmentID: UUID, recordingID: UUID) async -> EndConversationResult? {
+        guard let live = recordings.first(where: { $0.id == recordingID }),
+              !audioTrimPendingIDs.contains(recordingID) else { return nil }
+        // From the transcript edit until the audio is cut, no re-transcription
+        // may start (`prepareForRetranscription`): it would read the full
+        // audio and bring the removed lines back. Published so the menus
+        // that offer Re-transcribe disable themselves for the duration.
+        audioTrimPendingIDs.insert(recordingID)
+        defer { audioTrimPendingIDs.remove(recordingID) }
+        // Resolved from the row BEFORE the edit removes the lines it is
+        // measured against. nil only for unusable timestamps; the transcript
+        // edit goes ahead regardless and the audio is reported as not cut.
+        let cut = TranscriptTrim.audioCutTime(endingAt: segmentID, in: live.segments)
+        guard let edited = applyTranscriptEdit(recordingID: recordingID,
+                                               { $0.endingConversation(at: segmentID) })
+        else { return nil }
+        let audio: AudioTrimOutcome
+        if let cut {
+            audio = await trimAudio(recordingID: recordingID, toSeconds: cut)
+        } else {
+            audio = .noCutPoint
+        }
+        if let problem = Self.audioTrimProblem(audio) {
+            trimNotice = problem
+        }
+        let current = recordings.first(where: { $0.id == recordingID }) ?? edited
+        return EndConversationResult(recording: current, audio: audio)
+    }
+
+    /// Set when "End Conversation Here" trimmed a transcript but not its
+    /// audio. Lives on the store, not the detail view, because the audio
+    /// work can outlive the view that started it; `ContentView` presents it
+    /// and clears it. Published once per trim, so it is no load on the App
+    /// scene (see the `@StateObject` note in CLAUDE.md).
+    @Published var trimNotice: String?
+
+    /// Recordings between an "End Conversation Here" transcript edit and the
+    /// end of its audio cut. See `endConversation`.
+    @Published private(set) var audioTrimPendingIDs: Set<UUID> = []
+
+    /// Recordings whose `.txt` sidecar could not be rewritten (nor removed)
+    /// after a transcript edit, so it may still hold removed lines.
+    /// `persist()` retries them on every later write until one lands.
+    private var transcriptRewritesPending: Set<UUID> = []
+
+    /// Bumped each time a recording's audio file is replaced in place by a
+    /// trim (same file name, shorter content), so a player holding the old
+    /// file open knows to reload. An explicit signal rather than a shrinking
+    /// `duration`, which a transcription pass also produces.
+    @Published private(set) var audioRevisions: [UUID: Int] = [:]
+
+    /// What to tell the user when the transcript was trimmed but the audio
+    /// was not; nil when there is nothing to report.
+    nonisolated static func audioTrimProblem(_ outcome: AudioTrimOutcome) -> String? {
+        switch outcome {
+        case .trimmed:
+            return nil
+        case .unsupported:
+            return "The transcript was trimmed, but this recording's audio file can't be trimmed, so the full audio is kept."
+        case .noCutPoint:
+            return "The transcript was trimmed, but the line's timing couldn't be used to find where to cut, so the full audio is kept."
+        case .audioEndsBeforeCut:
+            return "The transcript was trimmed, but the audio file ends before that point, so nothing was cut from it."
+        case .abandoned:
+            return "The transcript was trimmed, but the recording changed while its audio was being cut, so the full audio is kept."
+        case .failed:
+            return "The transcript was trimmed, but cutting the audio failed, so the full audio is kept."
+        }
+    }
+
+    /// Apply a pure transcript edit to the LIVE row — never to a snapshot a
+    /// view captured, which can carry a stale `audioFileName` (see
+    /// `prepareForRetranscription`) — and write everything derived from the
+    /// segments: `recordings.json` and the `.txt` sidecar (both via
+    /// `update`), the `.srt`, and copies outside the store
+    /// (`onTranscriptLinesRemoved`).
+    private func applyTranscriptEdit(recordingID: UUID,
+                                     _ edit: (Recording) -> Recording?) -> Recording? {
+        guard let live = recordings.first(where: { $0.id == recordingID }),
+              canEditTranscriptNow(live),
+              var edited = edit(live) else { return nil }
+        // Pending name suggestions (#348) whose speaker has no lines left, or
+        // whose quoted evidence was among the lines just removed, go with
+        // them — a deleted line must not live on as a suggestion's quote.
+        edited.speakerNameSuggestions = edited.speakerNameSuggestionsSurvivingEdit
+        // `update` reports whether BOTH the `.txt` sidecar and
+        // recordings.json landed. The sidecar is what mila-mcp reads first
+        // (`MilaStoreReader.transcriptText`), so a write that failed there
+        // would leave the removed lines being served while the app shows
+        // them gone.
+        let saved = update(edited)
+        writeSRTIfCompleted(recordingID)
+        // Resolved again rather than handing `edited` on, so the hook sees
+        // exactly what the store holds.
+        guard let stored = recordings.first(where: { $0.id == recordingID }) else { return nil }
+        let durable = saved || settleUnsavedTranscriptEdit(stored)
+        recStoreLog.log("""
+            transcript edit on \(recordingID, privacy: .public): \
+            \(live.segments.count, privacy: .public) → \(stored.segments.count, privacy: .public) segments
+            """)
+        onTranscriptLinesRemoved?(stored)
+        // Not a success when recordings.json did not take it: the caller then
+        // skips what follows a saved edit (the audio cut, the summary
+        // refresh), and the user has already been told through `trimNotice`.
+        // A sidecar-only failure is NOT that case — the edit stands.
+        return durable ? stored : nil
+    }
+
+    /// `update` reported that the edit did not fully land. Find out which
+    /// half failed by retrying each, and return whether recordings.json —
+    /// the record of the edit itself — now holds it.
+    ///
+    /// The `.txt` sidecar is retried, then deleted if it cannot be written
+    /// (every reader — the app's `load`, mila-mcp's `MilaStoreReader` — then
+    /// rebuilds the text from the segments), and if even that fails it is
+    /// queued for a retry on every later `persist()`. The user is told only
+    /// when something is still wrong after the retries: recordings.json did
+    /// not save, or a stale sidecar is still on disk.
+    private func settleUnsavedTranscriptEdit(_ recording: Recording) -> Bool {
+        let url = transcriptURL(for: recording)
+        if !writeTranscript(for: recording) {
+            try? fileManager.removeItem(at: url)
+            if fileManager.fileExists(atPath: url.path) {
+                transcriptRewritesPending.insert(recording.id)
+            }
+        }
+        let persisted = persist()
+        let sidecarStale = transcriptRewritesPending.contains(recording.id)
+        if !persisted {
+            recStoreLog.error("transcript edit on \(recording.id, privacy: .public): recordings.json not saved")
+            trimNotice = "Mila removed the lines, but couldn't save the change to disk. Check that the recordings folder is available and has free space; until it saves, the lines may come back after Mila restarts."
+        } else if sidecarStale {
+            recStoreLog.error("transcript edit on \(recording.id, privacy: .public): .txt sidecar still stale")
+            trimNotice = "Mila removed the lines, but couldn't update the transcript's text file, so tools reading that file may still see them. Mila will keep retrying."
+        }
+        return persisted
+    }
+
+    /// `persist()`'s retry of sidecars `settleUnsavedTranscriptEdit` could
+    /// neither rewrite nor remove. Empty in the normal case.
+    private func retryPendingTranscriptRewrites() {
+        guard !transcriptRewritesPending.isEmpty else { return }
+        for id in transcriptRewritesPending {
+            guard let recording = recordings.first(where: { $0.id == id }) else {
+                transcriptRewritesPending.remove(id)
+                continue
+            }
+            if writeTranscript(for: recording) {
+                transcriptRewritesPending.remove(id)
+            }
+        }
+    }
+
+    /// What became of an audio trim. Every case but `.trimmed` leaves the
+    /// audio file exactly as it was.
+    enum AudioTrimOutcome: Equatable {
+        /// The audio now ends at `duration` seconds, and so does the row.
+        case trimmed(duration: Double)
+        /// No audio file, or a container this build does not rewrite
+        /// (`AudioTrimmer.supportedExtensions`).
+        case unsupported
+        /// The kept lines' timestamps gave no usable cut point.
+        case noCutPoint
+        /// The audio file, as decoded, already ends at or before the cut —
+        /// even though transcribed lines ran past it. Reported rather than
+        /// passed off as success: the user was told the audio would be cut.
+        case audioEndsBeforeCut
+        /// The row changed while the new file was being written — deleted,
+        /// a transcription pass queued, or its audio renamed by a
+        /// compression — so the result no longer describes it.
+        case abandoned
+        /// Reading or writing the audio failed.
+        case failed
+    }
+
+    /// Recordings with an audio trim in flight. Mutually exclusive with
+    /// `compressingIDs`: both replace the audio file, and whichever finished
+    /// second would put back what the first had removed.
+    private var trimmingAudioIDs: Set<UUID> = []
+
+    /// Whether `trimAudio` can rewrite this recording's audio at all — the
+    /// detail view words its confirmation on it.
+    func canTrimAudio(for recording: Recording) -> Bool {
+        let url = audioURL(for: recording)
+        return AudioTrimmer.supports(url) && fileManager.fileExists(atPath: url.path)
+    }
+
+    /// Cut a recording's audio at `seconds` and shorten its `duration` to
+    /// match. The trimmed audio is written to a hidden temporary file beside
+    /// the original — hidden so `recoverOrphanRecordings` (which skips hidden
+    /// files) can never resurrect a crash's leftover as a recording, and in
+    /// the same directory so the swap stays on one volume — and replaces the
+    /// original only once complete.
+    ///
+    /// A compression requested while the trim ran was turned away (the two
+    /// must not overlap); it is re-run here once the trim is done, so the
+    /// recording does not stay an uncompressed WAV until the next
+    /// "Compress existing recordings".
+    func trimAudio(recordingID: UUID, toSeconds seconds: Double) async -> AudioTrimOutcome {
+        let outcome = await performAudioTrim(recordingID: recordingID, toSeconds: seconds)
+        if compressionDeferredByTrim.remove(recordingID) != nil {
+            Task { [weak self] in await self?.compressRecordingAudio(id: recordingID) }
+        }
+        return outcome
+    }
+
+    /// Compressions that arrived while a trim held the audio file.
+    private var compressionDeferredByTrim: Set<UUID> = []
+
+    /// File-name prefix of the in-progress trim output. Hidden (leading dot)
+    /// so orphan recovery skips it; swept at load by
+    /// `removeAudioTrimLeftovers` in case a crash left one behind.
+    static let audioTrimTempPrefix = ".mila-trim-"
+
+    /// Delete trim outputs a crash or force-quit left in the recordings
+    /// folder. Nothing else writes files with this prefix, and no trim can
+    /// be in flight while the store is loading.
+    private func removeAudioTrimLeftovers() {
+        guard let names = try? fileManager.contentsOfDirectory(atPath: recordingsDirectory.path) else { return }
+        for name in names where name.hasPrefix(Self.audioTrimTempPrefix) {
+            try? fileManager.removeItem(at: recordingsDirectory.appendingPathComponent(name))
+        }
+    }
+
+    private func performAudioTrim(recordingID: UUID, toSeconds seconds: Double) async -> AudioTrimOutcome {
+        // A post-transcription compression may still be running (it starts
+        // when a pass completes). Let it land rather than refuse: the trim
+        // then works on the `.m4a` it produced. Bounded (~60 s), because a
+        // wait that never ends is worse than a reported failure.
+        var waits = 0
+        while compressingIDs.contains(recordingID), waits < 600 {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            waits += 1
+        }
+        guard !compressingIDs.contains(recordingID),
+              !trimmingAudioIDs.contains(recordingID) else { return .abandoned }
+        guard let rec = recordings.first(where: { $0.id == recordingID }),
+              rec.status != .pending, rec.status != .running,
+              !(isTranscriptEditBlocked?(recordingID) ?? false) else { return .abandoned }
+        guard canTrimAudio(for: rec) else { return .unsupported }
+        trimmingAudioIDs.insert(recordingID)
+        defer { trimmingAudioIDs.remove(recordingID) }
+
+        let source = audioURL(for: rec)
+        let temp = recordingsDirectory.appendingPathComponent(
+            "\(Self.audioTrimTempPrefix)\(UUID().uuidString).\(source.pathExtension)")
+        let written: Double
+        do {
+            guard let length = try await AudioTrimmer.writePrefix(of: source, seconds: seconds, to: temp) else {
+                return .audioEndsBeforeCut
+            }
+            written = length
+        } catch {
+            try? fileManager.removeItem(at: temp)
+            logTrimFailure(recordingID, stage: "write", error)
+            return .failed
+        }
+        // Re-resolve after the off-main write: the row may have been deleted,
+        // re-queued for transcription, or had its audio renamed meanwhile.
+        guard let idx = recordings.firstIndex(where: { $0.id == recordingID }),
+              recordings[idx].audioFileName == rec.audioFileName,
+              recordings[idx].status != .pending,
+              recordings[idx].status != .running else {
+            try? fileManager.removeItem(at: temp)
+            return .abandoned
+        }
+        do {
+            _ = try fileManager.replaceItemAt(source, withItemAt: temp)
+        } catch {
+            try? fileManager.removeItem(at: temp)
+            logTrimFailure(recordingID, stage: "replace", error)
+            return .failed
+        }
+        recordings[idx].duration = written
+        persist()
+        audioRevisions[recordingID, default: 0] += 1
+        recStoreLog.log("trimmed audio of \(recordingID, privacy: .public) to \(written, privacy: .public)s")
+        return .trimmed(duration: written)
+    }
+
+    /// The audio file name is title-derived and Cocoa quotes it (and its
+    /// folder) in `localizedDescription`, so only the domain and code are
+    /// public (`bugbot-rules/no-user-content-in-logs.md`).
+    private func logTrimFailure(_ recordingID: UUID, stage: String, _ error: Error) {
+        let ns = error as NSError
+        recStoreLog.error("""
+            audio trim \(stage, privacy: .public) failed for \(recordingID, privacy: .public) \
+            (\(ns.domain, privacy: .public) \(ns.code, privacy: .public)): \
+            \(error.localizedDescription, privacy: .private)
+            """)
+    }
+
+    /// Move a recording into a folder (or unfile it with nil). Auto-creates
+    /// the folder so callers can drag into a brand-new name without a
+    /// separate `createFolder` round-trip. Dedup is case-insensitive — if
+    /// the caller passes "work" but "Work" already exists, the recording is
+    /// filed under the existing "Work" rather than spawning a duplicate.
+    func assign(_ recording: Recording, toFolder folderName: String?) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
+        let normalized = folderName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = (normalized?.isEmpty ?? true) ? nil : normalized
+        let target: String? = trimmed.map { input in
+            folders.first { $0.caseInsensitiveCompare(input) == .orderedSame } ?? input
+        }
+        recordings[idx].folder = target
+        if let target, !folders.contains(target) {
+            folders.append(target)
+            folders.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+            persistFolders()
+        }
+        persist()
+    }
+
+    /// Persist (or clear) the `.txt` sidecar for a recording. Empty text
+    /// removes the file so we never leave a stale transcript around after a
+    /// re-transcription that came up silent.
+    /// Returns whether the sidecar on disk now reflects `recording` —
+    /// written, or removed for an empty transcript. `false` means an external
+    /// reader would see the PREVIOUS text (or none), which is why the result
+    /// is propagated out through `update` rather than only logged.
+    @discardableResult
+    private func writeTranscript(for recording: Recording) -> Bool {
+        let url = transcriptURL(for: recording)
+        let text = recording.fullText
+        do {
+            if text.isEmpty {
+                if fileManager.fileExists(atPath: url.path) {
+                    try fileManager.removeItem(at: url)
+                }
+            } else {
+                try text.write(to: url, atomically: true, encoding: .utf8)
+            }
+            return true
+        } catch {
+            // The recording id is the safe correlation key; the FILENAME is
+            // not. `FileTranscriber` derives `audioFileName` from the
+            // recording title (`freshAudioURL(suggestedName: safeStem)`), so
+            // a public interpolation of it puts the user's meeting title into
+            // the unified log, readable by anything that can read logs.
+            // `error.localizedDescription` needs the same care: Cocoa file
+            // errors quote the offending filename ("The file \u{201C}Q3
+            // board call.txt\u{201D} doesn't exist."), so redacting only the
+            // URL would leak the title through the error string instead.
+            // (CodeRabbit on #183, CWE-532.)
+            recStoreLog.error("""
+                failed to write transcript for \(recording.id, privacy: .public) \
+                (\(url.lastPathComponent, privacy: .private)): \
+                \(error.localizedDescription, privacy: .private)
+                """)
+            return false
+        }
+    }
+
+    /// Persist (or clear) the `.summary.txt` sidecar holding the LLM
+    /// summary. Mirrors `writeTranscript` — an empty/cleared summary
+    /// removes the file so a recording whose summary the user wiped (or
+    /// that the LLM regenerated as empty) doesn't keep showing the old
+    /// text in finder / external tools. `summary` lives in
+    /// `recordings.json` too, so the sidecar is an extra surface, not
+    /// the source of truth.
+    private func writeSummary(for recording: Recording) {
+        let url = summaryURL(for: recording)
+        let text = (recording.summary ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            if text.isEmpty {
+                if fileManager.fileExists(atPath: url.path) {
+                    try fileManager.removeItem(at: url)
+                }
+            } else {
+                try text.write(to: url, atomically: true, encoding: .utf8)
+            }
+        } catch {
+            // Same leak as `writeTranscript` above, and `print` is worse
+            // than a redacted logger: it carries no privacy annotation at
+            // all and stdio is captured into the unified log for an app
+            // launched by launchd.
+            recStoreLog.error("""
+                failed to write summary for \(recording.id, privacy: .public) \
+                (\(url.lastPathComponent, privacy: .private)): \
+                \(error.localizedDescription, privacy: .private)
+                """)
+        }
+    }
+
+    /// Mark a queued/in-progress recording as no longer transcribing after the
+    /// user cancelled it from the Queue. We land it in `.failed` — the existing
+    /// terminal state — rather than adding a dedicated `.cancelled` case: the
+    /// Queue only keeps `.pending`/`.running` rows, so a cancelled item drops
+    /// out of the Queue either way, and every status-rendering site (list rows,
+    /// detail view) already handles `.failed`. The recording + its audio stay on
+    /// disk so the user can still re-transcribe it later; use
+    /// `permanentlyDelete` when they want it gone.
+    ///
+    /// Paired with `TranscriptionService.cancel(recordingID:)`, which trips the
+    /// engine's abort flag so the in-flight whisper pass unwinds. That path
+    /// deliberately leaves the store status alone (the discard coordinator owns
+    /// the delete), so a Queue-level cancel must flip the status itself —
+    /// otherwise a `.running` item would sit in the Queue forever. No-op if the
+    /// recording is already in a terminal state.
+    /// Stop a queued/active transcription from the Queue and move the
+    /// recording to "Recently Deleted" rather than leaving a `.failed` row
+    /// cluttering the list. The status also flips to a terminal `.failed` so
+    /// the launch crash-recovery sweep and the Queue don't resurrect it. The
+    /// audio stays on disk (recoverable via Restore), so this is safe for mic
+    /// recordings and re-transcriptions of already-completed recordings — the
+    /// user gets their content back from the trash if they hit Stop by
+    /// mistake. No-op if the recording is already terminal (guards a stale
+    /// click racing a just-finished run). Paired with
+    /// `TranscriptionService.cancel(recordingID:)`, which trips the engine's
+    /// abort flag so the in-flight whisper pass unwinds.
+    func stopTranscription(_ recording: Recording) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
+        guard recordings[idx].status == .pending || recordings[idx].status == .running else { return }
+        recordings[idx].status = .failed
+        recordings[idx].deletedAt = Date()
+        // Settled: nothing left for a stop to undo.
+        recordings[idx].retranscriptionPriorState = nil
+        persist()
+    }
+
+    /// "Stop Transcribing": the user stopped a queued/active transcription to
+    /// run it later. Unlike `stopTranscription`, the recording stays in the
+    /// library — this is "not now", not "throw it away".
+    ///
+    /// The status has to leave `.pending`/`.running`, or the Queue keeps
+    /// listing the row and the launch recovery sweep restarts the run — the
+    /// exact CPU the user just declined. Where it lands:
+    ///  * **A re-run of a recording that already had a transcript** (Re-
+    ///    transcribe, in either language): the re-run is undone — status,
+    ///    language and model go back to what they were before
+    ///    `prepareForRetranscription` (`Recording.retranscriptionPriorState`,
+    ///    read off the row so it holds across a relaunch), and the
+    ///    transcript the pass never got to replace is still there. Demoting a
+    ///    finished transcript to `.failed` would switch off everything keyed
+    ///    on `.completed` (SRT rewrites, summaries, the MCP "latest recording").
+    ///  * **Anything else** — a first transcription, or a chunk-mode live
+    ///    draft still waiting on its first full pass: `.failed` plus
+    ///    `transcriptionDeferredAt`, so the UI says "stopped" rather than
+    ///    "failed" and offers Transcribe. `.failed` is the terminal state every
+    ///    status site and every older build already understands. A live draft
+    ///    keeps its text on screen; it just isn't passed off as finished —
+    ///    marking it `.completed` would skip the completion work (SRT,
+    ///    summary, compression) only a finished pass triggers.
+    ///
+    /// Applies to a row in Recently Deleted too: a pass keeps running after a
+    /// soft delete, and a stopped pass writes no status itself, so skipping
+    /// the row here would strand it at `.running` — and the launch sweep would
+    /// restart it every launch.
+    ///
+    /// No-op unless the row is still `.pending`/`.running`, so a click racing
+    /// a just-finished pass leaves the finished row alone. Pair with
+    /// `TranscriptionService.deferTranscription(of:)`, which is the only
+    /// caller — it decides whether there is a run to stop at all.
+    func markTranscriptionDeferred(_ id: UUID) {
+        guard let idx = recordings.firstIndex(where: { $0.id == id }) else { return }
+        let row = recordings[idx]
+        guard row.status == .pending || row.status == .running else { return }
+        if !recordings[idx].restoreRetranscriptionPriorState() {
+            recordings[idx].status = .failed
+            recordings[idx].transcriptionDeferredAt = Date()
+        }
+        // Consumed either way: the row is settled, there is no re-run left
+        // to undo.
+        recordings[idx].retranscriptionPriorState = nil
+        persist()
+    }
+
+    /// Move to "Recently Deleted". The audio file stays on disk until permanent delete.
+    func softDelete(_ recording: Recording) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
+        recordings[idx].deletedAt = Date()
+        persist()
+    }
+
+    /// Restore from "Recently Deleted".
+    func restore(_ recording: Recording) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
+        recordings[idx].deletedAt = nil
+        persist()
+    }
+
+    /// Remove the metadata + every on-disk file for a recording: the audio
+    /// plus all sidecars (`.txt` transcript, `.summary.txt`, `.srt`
+    /// subtitles). Missing files are ignored — each is best-effort so one
+    /// absent sidecar doesn't strand the others.
+    func permanentlyDelete(_ recording: Recording) {
+        recordings.removeAll { $0.id == recording.id }
+        try? fileManager.removeItem(at: audioURL(for: recording))
+        try? fileManager.removeItem(at: transcriptURL(for: recording))
+        try? fileManager.removeItem(at: summaryURL(for: recording))
+        try? fileManager.removeItem(at: subtitleURL(for: recording))
+        // Tombstone a deleted Voice-Memos import so the next sync doesn't
+        // resurrect it: the importer's dedup is keyed on the LIVE store, and
+        // the source memo still exists in the Voice Memos folder — deleting
+        // an imported memo silently never stuck before this. (Escape hatch:
+        // a manual File → Open import carries no memo ID and still works.)
+        if let memoID = recording.voiceMemoUniqueID {
+            voiceMemoTombstones.insert(memoID)
+            persistTombstones()
+        }
+        persist()
+        permanentlyDeleted.send([recording.id])
+    }
+
+    /// Backwards-compatible delete: soft-delete first, permanent if already trashed.
+    func delete(_ recording: Recording) {
+        if recording.isTrashed {
+            permanentlyDelete(recording)
+        } else {
+            softDelete(recording)
+        }
+    }
+
+    /// Permanently delete every trashed recording in one pass — the bulk
+    /// "Empty Trash" action. Applies the same per-recording cleanup as
+    /// `permanentlyDelete(_:)` (audio + `.txt`/`.summary.txt`/`.srt` sidecars,
+    /// plus a Voice-Memos tombstone so a deleted import doesn't resync), but
+    /// batches the store + tombstone writes so a full bin doesn't trigger one
+    /// persist per row. Returns the number of recordings removed; a no-op that
+    /// skips persisting when the trash is already empty.
+    @discardableResult
+    func emptyTrash() -> Int {
+        let trashed = recordings.filter { $0.isTrashed }
+        guard !trashed.isEmpty else { return 0 }
+
+        var tombstonedAny = false
+        for recording in trashed {
+            try? fileManager.removeItem(at: audioURL(for: recording))
+            try? fileManager.removeItem(at: transcriptURL(for: recording))
+            try? fileManager.removeItem(at: summaryURL(for: recording))
+            try? fileManager.removeItem(at: subtitleURL(for: recording))
+            if let memoID = recording.voiceMemoUniqueID {
+                voiceMemoTombstones.insert(memoID)
+                tombstonedAny = true
+            }
+        }
+
+        let trashedIDs = Set(trashed.map(\.id))
+        recordings.removeAll { trashedIDs.contains($0.id) }
+        if tombstonedAny { persistTombstones() }
+        persist()
+        permanentlyDeleted.send(trashed.map(\.id))
+        return trashed.count
+    }
+
+    func recordings(in category: HistoryCategory) -> [Recording] {
+        switch category {
+        case .recentlyDeleted:
+            return recordings.filter { $0.isTrashed }
+                .sorted { ($0.deletedAt ?? .distantPast) > ($1.deletedAt ?? .distantPast) }
+        case .meetings:
+            return recordings.filter { !$0.isTrashed && $0.source == .meeting }
+        case .dictations:
+            return recordings.filter { !$0.isTrashed && $0.source == .microphone && $0.title.hasPrefix("Dictation") }
+        case .transcriptions:
+            return recordings.filter { !$0.isTrashed }
+        }
+    }
+
+    /// All non-trashed recordings filed under `folderName`.
+    func recordings(inFolder folderName: String) -> [Recording] {
+        recordings.filter { !$0.isTrashed && $0.folder == folderName }
+    }
+
+    /// Live (non-trashed) Voice-Memo imports that originated from the Voice
+    /// Memos folder `folderID` (a `ZFOLDER.ZUUID`, or
+    /// `Recording.voiceMemoUnfiledFolderID` for the unfiled bucket). Only
+    /// `.voiceMemo` recordings with a matching recorded origin are returned —
+    /// legacy imports (nil origin) and the user's own recordings are excluded,
+    /// so the un-select cleanup can never sweep up something it didn't import.
+    func voiceMemoRecordings(fromFolderID folderID: String) -> [Recording] {
+        recordings.filter {
+            !$0.isTrashed
+                && $0.source == .voiceMemo
+                && $0.voiceMemoFolderUUID == folderID
+        }
+    }
+
+    /// Un-select cleanup (issue #57): move every live Voice-Memo import that
+    /// came from `folderID` to Recently Deleted. Soft-delete (not permanent)
+    /// so the user can restore them, and — crucially — so no tombstone is
+    /// written: the recordings stay in the store, so re-selecting the folder
+    /// won't re-import duplicates, and the source memos remain untouched in
+    /// Voice Memos. Returns the number moved to the trash.
+    @discardableResult
+    func softDeleteVoiceMemos(fromFolderID folderID: String) -> Int {
+        let now = Date()
+        var count = 0
+        for idx in recordings.indices where
+            !recordings[idx].isTrashed
+            && recordings[idx].source == .voiceMemo
+            && recordings[idx].voiceMemoFolderUUID == folderID {
+            recordings[idx].deletedAt = now
+            count += 1
+        }
+        if count > 0 { persist() }
+        return count
+    }
+
+    /// Non-trashed recordings that haven't been filed anywhere yet. These
+    /// surface in the sidebar's "Default" view. Replaces the old
+    /// Transcriptions/Meetings/Dictations category split — we now have one
+    /// catch-all bucket and named folders, period.
+    func unfiledRecordings() -> [Recording] {
+        recordings.filter { !$0.isTrashed && $0.folder == nil }
+    }
+
+    // MARK: - Folders
+
+    /// Create an empty folder. No-op if the trimmed name is empty or already
+    /// exists. Returns the normalized name that ended up in `folders` (or nil
+    /// if the input was rejected) so callers can immediately select it.
+    @discardableResult
+    func createFolder(_ name: String) -> String? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if folders.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
+            return folders.first { $0.caseInsensitiveCompare(trimmed) == .orderedSame }
+        }
+        folders.append(trimmed)
+        folders.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        persistFolders()
+        return trimmed
+    }
+
+    /// Rename a folder and re-tag every recording filed under it. Returns
+    /// the normalized new name on success, nil if the rename was rejected
+    /// (blank name, source missing, or collision with an existing folder).
+    @discardableResult
+    func renameFolder(_ oldName: String, to newName: String) -> String? {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, folders.contains(oldName) else { return nil }
+        if trimmed == oldName { return oldName }
+        // Collision check must exclude the folder we're renaming — otherwise
+        // a case-only rewrite ("work" -> "Work") falsely collides with itself.
+        if folders.contains(where: {
+            $0 != oldName && $0.caseInsensitiveCompare(trimmed) == .orderedSame
+        }) {
+            return nil
+        }
+        folders.removeAll { $0 == oldName }
+        folders.append(trimmed)
+        folders.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        for i in recordings.indices where recordings[i].folder == oldName {
+            recordings[i].folder = trimmed
+        }
+        persistFolders()
+        persist()
+        return trimmed
+    }
+
+    /// Delete a folder. Recordings filed under it become unfiled (folder = nil).
+    func deleteFolder(_ name: String) {
+        guard folders.contains(name) else { return }
+        folders.removeAll { $0 == name }
+        for i in recordings.indices where recordings[i].folder == name {
+            recordings[i].folder = nil
+        }
+        persistFolders()
+        persist()
+    }
+
+    private func load() {
+        removeAudioTrimLeftovers()
+        guard let data = try? Data(contentsOf: storeURL) else { return }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard var decoded = try? decoder.decode([Recording].self, from: data) else { return }
+
+        // Hydrate fullText from the sidecar `.txt`. For records persisted
+        // under the old "fullText inline" schema, the legacy decoder filled
+        // it in already — we migrate those to a sidecar on first sight so
+        // future writes are consistent.
+        var needsMigration = false
+        for i in decoded.indices {
+            let url = transcriptURL(for: decoded[i])
+            if let text = try? String(contentsOf: url, encoding: .utf8) {
+                decoded[i].fullText = text
+            } else if !decoded[i].fullText.isEmpty {
+                // Legacy record with inline text — keep what we decoded and
+                // flush a sidecar so subsequent loads pick it up from disk.
+                writeTranscript(for: decoded[i])
+                needsMigration = true
+            } else if !decoded[i].segments.isEmpty {
+                // Fallback: reconstruct from segments (shouldn't normally
+                // happen — segments + empty fullText only existed on the
+                // brief window where status was running and we hadn't
+                // flushed the final text yet).
+                // Shared with mila-mcp's `MilaStoreReader.transcriptText`
+                // so both readers reconstruct identical text — see
+                // `TranscriptFormatter.joinedFullText`.
+                decoded[i].fullText = TranscriptFormatter
+                    .joinedFullText(segments: decoded[i].segments)
+            }
+        }
+        self.recordings = decoded.sorted { $0.createdAt > $1.createdAt }
+        let recovered = recoverOrphanRecordings()
+        if needsMigration || !recovered.isEmpty {
+            persist()  // re-write JSON without inline fullText / with recovered entries
+        }
+    }
+
+    /// IDs of recordings that were re-created from orphan .wav files at
+    /// launch — i.e. the app crashed (or was force-quit) mid-recording so
+    /// the audio file exists on disk but never made it into recordings.json.
+    /// `MilaApp` consumes this list once after init to auto-enqueue them
+    /// for transcription, then clears it.
+    private(set) var pendingRecoveryIDs: [UUID] = []
+
+    func consumePendingRecoveryIDs() -> [UUID] {
+        let ids = pendingRecoveryIDs
+        pendingRecoveryIDs = []
+        return ids
+    }
+
+    /// Size of a WAV that captured nothing. `AVAudioFile` reserves a 4 KB
+    /// header block on open, so a recording that never received a frame is
+    /// exactly this big — not the 44 bytes a raw WAV header would suggest.
+    /// The old 512-byte guard therefore never fired, and every empty capture
+    /// came back after the next launch as a "Recovered recording" row that
+    /// transcribed to nothing and settled at `.failed`.
+    static let emptyWAVByteCount = 4096
+
+    /// Crash recovery: scan the recordings directory for `.wav` files that
+    /// no Recording in the store points at. Each orphan was a recording in
+    /// progress when the app died — the audio is on disk (AVAudioFile
+    /// writes WAV frames incrementally), the metadata was never persisted.
+    /// Re-attach those files with `.pending` status so the user sees them
+    /// in the list and so the launch-time recovery sweep can enqueue them
+    /// for transcription. Returns the list of newly-added recordings so
+    /// the caller can decide whether to re-persist.
+    @discardableResult
+    private func recoverOrphanRecordings() -> [Recording] {
+        let referenced = Set(recordings.map { $0.audioFileName })
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: recordingsDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        var added: [Recording] = []
+        for url in entries where url.pathExtension.lowercased() == "wav" {
+            let name = url.lastPathComponent
+            if referenced.contains(name) { continue }
+            // Skip captures that hold no audio. The threshold is a byte count
+            // rather than a decoded frame count on purpose: a genuinely crashed
+            // recording has an UNFINALIZED header claiming zero frames while
+            // its samples are on disk, so asking AVAudioFile how long it is
+            // would discard exactly the recordings this sweep exists to save.
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            if size <= Self.emptyWAVByteCount { continue }
+            let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
+            let recovered = Recording(
+                title: recoveryTitle(at: mtime),
+                createdAt: mtime,
+                duration: 0,  // filled in by the transcription path
+                source: .microphone,  // best guess; the original source isn't recoverable
+                audioFileName: name,
+                status: .pending
+            )
+            recordings.insert(recovered, at: 0)
+            added.append(recovered)
+            pendingRecoveryIDs.append(recovered.id)
+            // `name` came off disk and is title-derived for anything that
+            // arrived through the import path.
+            recStoreLog.log("""
+                recovered orphan recording \(recovered.id, privacy: .public) \
+                (\(name, privacy: .private), \(size, privacy: .public) bytes)
+                """)
+        }
+        if !added.isEmpty {
+            recordings.sort { $0.createdAt > $1.createdAt }
+        }
+        return added
+    }
+
+    private func recoveryTitle(at date: Date) -> String {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return "Recovered recording · \(f.string(from: date))"
+    }
+
+    /// Returns whether `recordings.json` on disk now reflects the in-memory
+    /// store. `false` means a separate process still reads the previous
+    /// contents — see `update(_:)` for why that has to be reportable.
+    @discardableResult
+    private func persist() -> Bool {
+        retryPendingTranscriptRewrites()
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        do {
+            let data = try encoder.encode(recordings)
+            try data.write(to: storeURL, options: .atomic)
+            return true
+        } catch {
+            // `.private` on the description — and this one really did need it,
+            // contrary to the exception I claimed last round. `storeURL`
+            // follows the user's chosen storage directory (see
+            // `relocateRecordings`), and Cocoa quotes the CONTAINING FOLDER in
+            // the message: "You don't have permission to save the file
+            // “recordings.json” in the folder “Acme Corp”." That is the same
+            // mechanism that leaked recording titles, and a folder the user
+            // picked can name a client, an employer or a project. Reasoning
+            // about the fixed FILENAME and stopping there was the mistake.
+            // (CodeRabbit on #183, CWE-532.)
+            //
+            // Domain + code stay public so a real failure is still diagnosable
+            // without the path: they are what separates "no permission"
+            // (NSCocoaErrorDomain 513) from a full disk or a missing
+            // directory. The filename is a literal, so naming WHICH write
+            // failed reveals nothing.
+            let ns = error as NSError
+            recStoreLog.error("""
+                persist failed for recordings.json \
+                (\(ns.domain, privacy: .public) \(ns.code, privacy: .public)): \
+                \(error.localizedDescription, privacy: .private)
+                """)
+            return false
+        }
+    }
+
+    // MARK: - Voice-memo tombstones
+
+    /// Voice-memo unique IDs the user permanently deleted from Mila. The
+    /// importer skips these on every sync — without the tombstone, a
+    /// deleted import re-imported (and re-transcribed) on the next FSEvents
+    /// fire or rescan, because the dedup set is built from the live store
+    /// and the source memo still exists in the Voice Memos folder.
+    /// Persisted at the original root (app state, not user content — it
+    /// deliberately does NOT travel with a relocated recordings folder).
+    private(set) var voiceMemoTombstones: Set<String> = []
+    private let tombstonesURL: URL
+
+    private func loadTombstones() {
+        guard let data = try? Data(contentsOf: tombstonesURL),
+              let ids = try? JSONDecoder().decode(Set<String>.self, from: data) else { return }
+        voiceMemoTombstones = ids
+    }
+
+    private func persistTombstones() {
+        do {
+            let data = try JSONEncoder().encode(voiceMemoTombstones)
+            try data.write(to: tombstonesURL, options: .atomic)
+        } catch {
+            // Deliberately `.public`, and the second of the two writes that
+            // still are — the other is the store-location pointer above.
+            // `tombstonesURL` is anchored to `originalRootDirectory`, which
+            // `relocateRecordings` never moves (it moves `recordingsDirectory`
+            // / `storeURL` / `foldersURL` and leaves this alone), so the folder
+            // Cocoa quotes in the message can only ever be “Mila”. Contrast
+            // `persist()` / `persistFolders()` below, which follow the user's
+            // chosen directory and therefore redact. Was a bare `print`, which
+            // is public with no annotation to reason about at all.
+            // (Issue #213.)
+            recStoreLog.error("tombstones persist error: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func loadFolders() {
+        // Folders stored as a plain JSON array of strings. Seed the union of
+        // (persisted list, any folder names already referenced by recordings)
+        // so we never lose a folder even if folders.json wasn't written yet
+        // — e.g. tests that build a Recording with `folder: "Work"` directly.
+        var union = Set<String>()
+        if let data = try? Data(contentsOf: foldersURL),
+           let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            union.formUnion(decoded)
+        }
+        for r in recordings {
+            if let f = r.folder, !f.isEmpty { union.insert(f) }
+        }
+        self.folders = union.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private func persistFolders() {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        do {
+            let data = try encoder.encode(folders)
+            try data.write(to: foldersURL, options: .atomic)
+        } catch {
+            // Same treatment as `persist()` above, and for the same reason:
+            // `foldersURL` follows the user's chosen storage directory (see
+            // `relocateRecordings`), and Cocoa quotes the CONTAINING FOLDER
+            // in the message — "You don't have permission to save the file
+            // “folders.json” in the folder “Acme Corp”." A folder the user
+            // picked can name a client, an employer or a project, so the
+            // description is `.private`.
+            //
+            // Domain + code stay public: they are what separates "no
+            // permission" (NSCocoaErrorDomain 513) from a full disk or a
+            // missing directory, and they name no path. The filename in the
+            // message is a literal.
+            //
+            // The sibling `persistTombstones` / store-location writes keep a
+            // plain message because their URLs are anchored to
+            // `originalRootDirectory`, which `relocateRecordings` never
+            // moves — the containing folder there can only ever be `Mila`.
+            // (CodeRabbit on #183, CWE-532.)
+            let ns = error as NSError
+            recStoreLog.error("""
+                persistFolders failed for folders.json \
+                (\(ns.domain, privacy: .public) \(ns.code, privacy: .public)): \
+                \(error.localizedDescription, privacy: .private)
+                """)
+        }
+    }
+}

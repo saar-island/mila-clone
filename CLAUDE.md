@@ -1,0 +1,143 @@
+# Mila
+
+A macOS (Swift/SwiftUI) local transcription app built on whisper.cpp, with optional speaker diarization via pyannote.audio.
+
+## Architecture
+
+- **Build system:** XcodeGen (`project.yml` is the source of truth, not the .xcodeproj)
+- **Minimum deployment target:** macOS 14.0, Swift 5.10
+- **Key dependencies:** TranscriptionCore (local Swift package wrapping whisper.cpp), Sparkle (auto-updates)
+- **Project layout:**
+  - `Mila/Models/` — data models and settings (`Recording`, `DiarizationSettings`, etc.)
+  - `Mila/Transcription/` — transcription engine, speaker diarizer, exporter
+  - `Mila/Views/` — SwiftUI views (ContentView, SettingsView, SidebarView, etc.)
+  - `Mila/Resources/` — Info.plist, entitlements, bundled diarization models
+  - `Mila/Resources/DiarizationModels/` — bundled pyannote speaker diarization model weights (~31 MB)
+  - `MilaTests/` — unit tests
+  - `Packages/TranscriptionCore/` — cross-platform Swift package: WhisperEngine (whisper.cpp bindings), WAVReader, WER calculator, and E2E transcription test fixtures
+  - `Packages/MilaKit/` — zero-dependency Swift package shared by the app and the `mila-mcp` helper: TranscriptFormatter, the read-only `StoredRecording` mirror of recordings.json, `MilaStoreReader`, the live-transcript snapshot schema, and the MCP tool handlers
+  - `MilaMCP/` — the `mila-mcp` executable (MCP stdio server over Mila's transcriptions), embedded at `Mila.app/Contents/MacOS/mila-mcp`; see `docs/mcp.md`
+  - `scripts/` — release/build scripts (make-dmg.sh, etc.)
+  - `site/` — the public one-pager, published into the `gh-pages` branch next to the Sparkle `appcast.xml` by `.github/workflows/pages.yml`. Never switch the Pages source to "GitHub Actions": pushes to `gh-pages` would stop being served and the update feed would freeze. See `docs/website.md`
+
+## Conventions
+
+### Environment Objects
+New app-wide settings (like `DiarizationSettings`) must be:
+1. Instantiated in `MilaApp.init()` as a `@StateObject`
+2. Injected via `.environmentObject()` on both the main window and the Settings scene
+3. Accepted in tests via a custom `UserDefaults` suite (not `.standard`) to avoid polluting state
+
+**An App-level `@StateObject` must not carry a high-frequency `@Published`.** A `@StateObject` subscribes its owner to `objectWillChange`, and the owner here is `MilaApp` — so every publish re-evaluates the App `body` and re-diffs every scene (window root view, sidebar outline view, `.commands` → main menu), ~10–20 ms each, whatever the body reads. `RecordingSession`'s per-audio-buffer `micLevel`/`systemLevel` and 5 Hz `elapsed` did exactly that and pinned the main thread at 60–75% for whole recordings (#280). Anything that changes at audio or timer cadence goes on its own small `ObservableObject` (`RecordingMeters`, `InputLevelMeter`) that is injected separately and observed only by the leaf view that displays it; the parent keeps read-only passthroughs for one-shot readers. `RecordingSessionMetersTests` counts `objectWillChange` on both objects to pin the split — a round-trip test cannot, because the values read the same whichever object publishes them.
+
+### Python Subprocess Integration
+When calling Python ML pipelines from Swift via `Process`:
+- Use inline Python scripts via `-c` argument (not bundled .py files) for the main pipeline -- this avoids path-resolution issues with app bundles
+- Always separate stdout (JSON data) from stderr (diagnostic logs) -- pyannote and torch emit warnings to stderr that corrupt JSON parsing
+- **Drain both pipes concurrently BEFORE `waitUntilExit()`** -- macOS pipe buffers are ~64 KB; if the subprocess fills a pipe before the parent reads, both sides deadlock. Use `Task.detached` to read pipes, then await after `waitUntilExit()`. See `.claude/rules/python-subprocess.md` for the correct pattern.
+- Run Python processes on `Task.detached(priority: .userInitiated)` to avoid blocking the main actor
+- Diarization models are bundled in the app (no HuggingFace token needed). The inline script receives the bundle models path as a CLI argument and loads the pipeline from a local config.yaml with `Pipeline.from_pretrained()`
+- **Bundled model directory names must preserve the original HuggingFace model ID structure.** pyannote dispatches embedding backends via substring matching on the path (e.g., `"pyannote"` -> torch, `"wespeaker"` -> ONNX). See `.claude/rules/python-subprocess.md` for details.
+
+### Python / PyTorch Compatibility Patches
+The pyannote.audio + speechbrain stack requires two runtime monkey-patches (applied in the inline script):
+1. **torch.load `weights_only` patch:** PyTorch >= 2.6 changed the default to `True`, breaking pyannote's checkpoint loading. Patch `torch.load` to force `weights_only=False`.
+2. **speechbrain LazyModule patch:** pytorch_lightning stack inspection triggers speechbrain's lazy imports for optional packages (k2_fsa, nlp, huggingface.wordemb). Patch `LazyModule.ensure_module` to return a dummy module instead of raising `ImportError`.
+
+These patches live in `SpeakerDiarizer.swift`'s inline diarize script. If upgrading pyannote.audio or speechbrain, check if these patches are still needed.
+
+### Settings Persistence with UserDefaults
+- Use namespaced keys: `"diarization.enabled"`, `"diarization.pythonPath"`, etc.
+- For verification/setup state that should survive app restarts, persist a `verified` flag alongside the verified parameter values (path). On launch, restore only if current values match the persisted ones.
+- Computed `status` properties must check `verificationStatus` before `lastVerifyResult` -- the persisted verified state should take precedence over nil in-memory verify results on launch.
+
+### MDM-managed settings (`ManagedSettings`)
+- A configuration profile can force the `.milaconfig` keys (nested dictionaries) for the `io.island.whisper.IslandWhisper` domain (docs/mdm.md, #360). `ManagedSettings.loadFromSystem()` reads them once in `MilaApp.init()` — only **forced** values, via `CFPreferencesAppValueIsForced` — and the one snapshot is passed as `managed:` to each settings object that owns a `.milaconfig` field and to `MilaConfigImporter`. A forced flat key (the dotted path, or Mila's own storage key — `ManagedField.storageKey`) counts as managed too, because cfprefsd serves it to every reader anyway. Tests inject a `ManagedPreferencesSource` fake or build a `ManagedSettings` by hand — never read the real domain.
+- `ManagedField` is the single list of manageable fields; the parser, the importer's precedence and the tests all iterate it. Each managed property is a computed property over private `@Published` storage whose setter opens with `guard !isManaged(.field)`, so a locked write is refused before anything is stored, published or persisted, and the user's own stored value survives underneath. Never revert in `didSet` (it publishes the rejected value first). A managed `apiKey` never touches the Keychain.
+- Ask "is it managed?" only through the owning object's `isManaged(_:)`. Precedence is managed > `.milaconfig` > user: `MilaConfigImporter` derives both its skip list and the filtered config from `ManagedField`. A new `MilaConfig` field needs a `ManagedField` case (`test_everyMilaconfigField_isManageable`), an enforcing setter (`test_everyManagedField_refusesWritesAndPersistsNothing`, an exhaustive switch), and a disabled control with `ManagedSettingNote(field:)` in Settings.
+
+### MCP server (mila-mcp) and MilaKit
+
+- The app persists two cross-process contracts for the embedded MCP helper: `store-location.json` (written by `RecordingStore` on init + relocate — where recordings.json currently lives) and `live/current.json` (the live-transcript sidecar written during recording by `LiveTranscriptSidecarWriter`). Both live at the DEFAULT app-support root and deliberately do not travel with a relocated recordings folder.
+- **Any change to what `Recording.encode(to:)` writes into recordings.json must be mirrored in MilaKit's `StoredRecording`** — `StoredRecordingDriftTests` in MilaTests is the tripwire. That includes the NESTED element types (`TranscriptSegment`, `ActionItem`): they encode as objects, so a top-level key-set check sees `segments`/`actionItems` present on both sides however far the elements have drifted, which is how `ActionItem.source` stayed unmirrored. The test compares nested key sets too, each with its own allowlist. Keep `StoredRecording` decoding lenient (`decodeIfPresent` + defaults) so an older helper survives a newer app's schema.
+- MilaKit must stay dependency-free (in particular: no TranscriptionCore) — it links into `mila-mcp`, which must not drag in the whisper xcframework. Tool logic lives in `MilaMCPToolHandlers` (pure JSON), not in the executable.
+- **The helper is off by default and must stay that way.** A third contract, `mcp-access.json`, carries the user's consent; `MCPAccessGate` fails closed on a missing, unreadable, or malformed file, and `handle(tool:)` re-reads it on *every* call so revoking access bites a server that is already running. `MCPAccessSettings` owns the UserDefaults key (`mcp.enabled`) and mirrors it to that file on change and on every launch. Do not add a cache in front of the gate, and do not let a new tool path skip `handle(tool:)`.
+- **Both directions of the gate must fail closed, and they are not symmetric.** Failing to publish `enabled` is safe (the gate keeps denying); failing to publish `disabled` is not, because the previous `enabled: true` file survives a failed atomic write and keeps granting. `MCPAccessGate.set(false, …)` therefore escalates to deleting the file and throws only when access is *still* granted, and `MCPAccessSettings` forces the toggle back ON in that case — never show an off switch that didn't turn anything off.
+- **Writing files is a second consent.** `save_transcript` also needs `fileExportEnabled` in `mcp-access.json` (`MCPAccessGate.isFileExportEnabled`, Settings toggle `mcp.fileExportEnabled`, shown only under `enabled` and cleared when it is turned off). A file without the key — every pre-existing grant — means reads only. Same invariants as the read gate: checked in `handle(tool:)` on every call, no cache, and revoking it fails closed the same way (a failed `set(_, fileExport: false)` escalates to deleting the file; `MCPAccessSettings` reads the gate back and forces whichever toggle is still granting back ON).
+- **Consent is necessary but not sufficient.** What gets mirrored is `enabled && storeLocationIsDiscoverable`. `RecordingStore` verifies every `store-location.json` write by reading back what an external reader would resolve (`MilaStoreReader.resolvesActiveStore`) — because `relocateRecordings` switches the live paths *before* writing the pointer and leaves the old store on disk, so a failed write leaves the helper reading a store the app has stopped writing to. Relocation is deliberately NOT rolled back (the preference is persisted upstream, so a rollback wouldn't converge); access is paused instead and returns on its own once the pointer verifies.
+- Anything the MCP surface exposes must agree with `listRecordings`' trashed filter — `recording(id:)` excludes trashed rows too, so a retained UUID is not a way back into a deleted transcript. Keep that invariant in `MilaStoreReader`, not in the handler.
+- `stopRecording` publishes the live sidecar's `completed` + `final_recording_id` handoff only *after* the final `store.update` and only if that update reported success (`update(_:)` returns whether the `.txt` sidecar and recordings.json both landed). Both the ordering and the success check exist because `MilaStoreReader.transcriptText` reads the sidecar first, so a premature or unverified handoff points a client at a stale transcript.
+- The gate is a **consent** control, not a privilege boundary — `mila-mcp` runs as the user and could read the store regardless. Describe it that way in UI and docs; claiming it contains a hostile process would be false.
+- `MilaDataSource` is the seam that keeps the architecture reversible: `FileBackedDataSource` is the only implementation, and swapping in a socket-backed one (Mila serving a local API) should not require touching the handler bodies. Reading files directly is a deliberate choice — it keeps transcripts readable while Mila is closed. See `docs/mcp.md` for the full reasoning.
+- **`MilaStoreReader` stays stateless and `Sendable`; `searchTranscripts` gets cheap by doing less, not by remembering.** Three things make the cost survivable and all are easy to undo by accident. `TranscriptFormatter.plainText` takes `fallback:` as an `@autoclosure`, so `namedTranscript` reads a recording's `.txt` sidecar only when NO segment carries a speaker label — hoisting that expression into a `let` puts one wasted file read back on every recording a search touches. `sort: .createdAt` traverses in output order and stops at the `limit`-th hit; `sort: .relevance` cannot (ranking by match count has to score everything) and **must keep scoring every candidate** — capping the candidate set loses the best hit in a large store silently, which is a worse answer rather than a cheaper one. And relevance scores WITHOUT rendering: `rawScore` counts the query against the raw segment strings the decode already produced, so the formatted transcript is built only for the hits that come back (#241). `MilaStoreReaderTests` pins all three by counting sidecar reads and renders through internal `SidecarReader` / `TranscriptRenderer` seams — discarded work is invisible in the results, so nothing else can see it. See #201, #241.
+- **`rawScore`'s shortcut is a proof, not a heuristic, and the proof is about whitespace.** `plainText` joins pieces with `": "`, `" "` and `"\n"` — every separator contains whitespace — so a run of the query with no whitespace in it can never straddle two pieces, and can be looked for in the raw pieces instead. Hence: a whitespace-free query gets an exact count summed over segments; any other query gets its longest whitespace-free run used only to rule the recording OUT. Two cases deliberately fall back to rendering — a recording with no speaker labels (its transcript is the sidecar, so answering means reading the file anyway) and a query a speaker label carries (labels are counted once per TURN, which the flat segment list does not describe). Widening the shortcut past that reasoning changes search results, so `test_scoring_from_raw_segments_agrees_with_the_rendered_count` compares the two counts directly over a store built to hit every case.
+
+### Sharing recordings between users (`.milashare`)
+
+- A `.milashare` is a zip (`ZipArchiver`, via `ditto`) with **three fixed entry names**: `manifest.json`, `audio.wav|m4a`, `transcript.txt`. `RecordingShareImporter` reads only those names and verifies the audio's size and SHA-256 against the manifest; the library filename is minted on the receiving side. Do not add a code path that reads an entry by a name taken from the archive.
+- **The archive's central directory is checked BEFORE `ditto -x` runs, and that check must stay in front of it.** `ditto` inflates every entry it finds with no way to say which or how much, so `ZipArchiver.listEntries` (a native parser — no text output to misparse, type bits available) feeds `RecordingShareImporter.validateEntries`, which requires exactly the fixed names, each a regular file, the text entries under `maxManifestBytes` / `maxTranscriptBytes` and the declared total under `maxUncompressedBytes`; a zip bomb or a stray 40 GB entry is refused having cost one read of the directory. A declared size can lie, so the caps are re-checked against the extracted files before they are read (`requireSize`) and the audio's real size against the manifest; the listing can lie too (`ditto` follows the LOCAL headers), so `requireExtractedEntries` requires the staging directory to hold exactly the declared names once it has run. What this does NOT bound is an entry whose header lies small while its deflate stream inflates large — stopping that needs an inflater with a byte budget, which `ditto` is not.
+- **`ShareManifest.RecordingPayload` is a deliberately separate DTO, not `Recording`'s Codable.** The share format is a second cross-version contract (sender build ≠ receiver build), independent of the `recordings.json` contract. `ShareManifestTests.test_every_recording_key_is_shared_or_deliberately_excluded` is its drift tripwire: a new `Recording` field must either be carried or allowlisted there with a reason. Do not "simplify" the payload back to `Recording`.
+- `Recording.sharedBy` / `sharedAt` ARE persisted in `recordings.json` (attribution; `encodeIfPresent`, so non-shared recordings encode byte-identically) and are therefore mirrored in MilaKit's `StoredRecording` and exposed as `shared_by` by `list_recordings`. They do not change `source` — a shared Zoom meeting is still a meeting.
+- Imports go through `RecordingStore.upsertImported`, never `add`: it replaces by id or inserts at the recording's own `createdAt`, and is the one entry point that guarantees a UUID appears at most once (every lookup is `firstIndex(where: id ==)`, so a duplicate would shadow). Audio is copied to `<dest>.partial` and renamed in the same main-actor turn as the store write so a crash can't leave a `.wav` for `recoverOrphanRecordings` to resurrect. **`recordings.json` is the commit point for the whole import.** The voice-profile plan is applied BEFORE the row (the row's labels come out of its `nameMapping`), so `confirm()` applies it inside `SpeakerProfileStore.staged { }` — memory only, `speaker-profiles.json` untouched — and `commit`s it after `.saved` / `.savedWithoutTranscript` or `discard`s it on `.notSaved`. A failed or crashed import must leave no fold, no new profile and no import token on disk, or the retry reads as "already imported" (#319, #329); a crash between the row and the profile commit loses only the merge, which a re-import redoes. Do not move the profile write back ahead of the row. Separately, a `speaker-profiles.json` that `load()` could not parse is moved aside to `speaker-profiles.damaged-<timestamp>.json` by the first `save()`, never written over; those copies count toward `hasStoredProfilesOnDisk` and `deleteAllProfiles` removes them.
+- Voice profiles travel only when the sender ticks the opt-in (`SharedSpeakersExportSelection.includeProfiles`, default off, never persisted). On import, `SpeakerProfileImportResolver` matches each shared voice against every local profile by cosine similarity; the suggestion only seeds `Row.target`, and **every row's menu must keep offering every local profile, "add as new" and "skip"** — only the hard blockers (voice recognition off / not ready, unknown model, wrong width, invalid profile) remove it. `VoiceProfile` carries an `embeddingModel` stamp (legacy rows resolve to `SpeakerEmbeddingModel.current`, valid only while a single model has ever shipped) and `importedShares` tokens that make re-importing a bundle a no-op; the tokens live on the profile so deleting it forgets them.
+
+### Speaker name suggestions (#348)
+
+- `SpeakerNameSuggester` proposes names for unnamed speakers — "Your name" (`SpeakerIdentitySettings`, Settings → Speakers) for the single voice on a `.microphone`/`.voiceMemo` recording, and names an LLM finds stated in the transcript. **It only ever writes `Recording.speakerNameSuggestions`, never `speakerNames`.** Accepting goes through `RecordingStore.acceptSpeakerNameSuggestion` → `setSpeakerName`, the normal rename path, so a voice profile learns a name only after the user accepts it. Do not add a path that applies a suggestion automatically: a wrong name folded into a profile auto-names that voice in every future recording.
+- Every LLM mapping needs evidence about THAT speaker: `parseSuggestions` keeps an entry only if its quote (two or more words) states the name as a whole word and is either a self-introduction in the speaker's own turn (`isSelfIntroduction`) or the name addressed as a vocative in the turn right before theirs (`addressesByName`) — never the previous speaker introducing themselves. Ambiguous answers and names another speaker already has are dropped. Widening that is a behaviour change, not a cleanup.
+- `retireSpeaker` drops the retired id's suggestion and `splitSegmentSpeaker` treats suggestion keys as used ids, so a stale suggestion can never land on an unrelated voice. A transcript edit (`applyTranscriptEdit`) drops suggestions whose speaker has no lines left or whose quote was on a removed line (`speakerNameSuggestionsSurvivingEdit`).
+- Meetings get no "me" suggestion on purpose: `RecordingSession` mixes mic and app audio into one mono track, so nothing downstream can tell which diarized speaker is the local user.
+- `speakerNameSuggestions` is keyed by raw speaker id, so every pass that re-keys ids clears it alongside `speakerNames`. It is deliberately NOT mirrored in MilaKit's `StoredRecording` nor carried in a `.milashare` (allowlisted in both tripwire tests): those surfaces expose confirmed names only.
+
+### Tests
+
+- `TranscriptionService` now requires a `diarizationSettings:` parameter. In tests, always pass `DiarizationSettings(defaults: .init(suiteName: "TestClassName.diarization")!)` to isolate from user defaults.
+- Run tests with `make test` or via Xcode. Package tests: `make package-test` (TranscriptionCore + MilaKit).
+- `AppSceneChurnTests` (CI-only, `MILA_APP_CHURN_E2E=1`) pumps 12 s of fixture audio through the HOST app's real `RecordingSession` and asserts a publish budget per App-level `@StateObject`, via `AppSceneChurnProbe` (DEBUG-only: counts `MilaApp.body` evaluations and registers every App-level object by name). It exists because the #280 class of regression — one object publishing per audio buffer, the App scene re-diffing each time — is invisible in logs and only shows up in Activity Monitor. Keep it count-based: publish counts are deterministic on a loaded runner, a CPU threshold is not (the CPU fraction is asserted only as a wide backstop). Adding a new App-level `@StateObject` needs no change here — `MilaApp.init` registers them by pattern.
+
+## Release Process
+- **Release notes are REQUIRED, first.** Every release must add
+  `RELEASE_NOTES/v<MARKETING_VERSION>.md` (Markdown, user-facing). This file
+  becomes the Sparkle appcast `<description>` — i.e. the in-app "What's New"
+  popup users see on update. Without it that popup is blank ("a new version is
+  available" with no changelog). The signing pipeline runs
+  `scripts/check-release-notes.sh <version>` **before building** and FAILS the
+  release if the file is missing/empty/boilerplate, so this can't be skipped.
+  Do NOT rely on the `project.yml` changelog comment or the GitHub Release body —
+  neither feeds the appcast. See `RELEASE_NOTES/README.md`.
+- Version is bumped only in `project.yml` (`MARKETING_VERSION` +
+  `CURRENT_PROJECT_VERSION`). `Info.plist` inherits both via
+  `$(MARKETING_VERSION)` / `$(CURRENT_PROJECT_VERSION)` — never hardcode
+  literals there.
+- Tags are `v`-prefixed: `v1.2.8`. `CURRENT_PROJECT_VERSION` (the build
+  number) must increase monotonically — Sparkle keys updates on it.
+- A local DMG for testing: `make dmg VERSION=<x.y.z>` (the explicit
+  `VERSION=` is required — see the build skill). It signs with the persistent
+  "Mila Local Dev" cert when that cert exists in the login keychain (created
+  by `scripts/install-debug.sh`; keeps TCC mic/recording grants across
+  installs) and falls back to ad-hoc otherwise. To force an ad-hoc build —
+  e.g. to test the Gatekeeper right-click → Open first-launch prompt — run
+  `CODESIGN_IDENTITY=- make dmg VERSION=<x.y.z>`.
+- Notarized, signed release builds and Sparkle appcast publishing are produced
+  by a separate, private signing pipeline maintained by the original authors;
+  that toolchain is not part of this repository. Forks that want notarized
+  builds should sign with their own Apple Developer ID and publish their own
+  appcast (see `SUFeedURL` / `SUPublicEDKey` in `project.yml`).
+
+### Beta releases (Sparkle beta channel)
+- Publishing a beta takes nothing extra: set `MARKETING_VERSION` to a
+  pre-release version (e.g. `1.9.2-beta.1`), add
+  `RELEASE_NOTES/v1.9.2-beta.1.md`, and tag `v1.9.2-beta.1`. There is **no**
+  Jenkins parameter and **no** manual appcast edit.
+- Beta-ness is derived from the `MARKETING_VERSION` string by the signing
+  pipeline: a bare `X.Y.Z` becomes a normal GitHub Release with no
+  `<sparkle:channel>` (offered to everyone); any `-suffix` becomes a GitHub
+  Release with `prerelease=true` and an appcast item tagged
+  `<sparkle:channel>beta</sparkle:channel>`, offered only to users who ticked
+  Settings → Updates → "Enable beta version".
+- `beta` is the **only** channel the app's Sparkle delegate recognises
+  (`allowedChannels(for:)` in `Mila/App/MilaApp.swift` returns `["beta"]` or
+  `[]`), so `-alpha` / `-rc` versions are tagged `beta` too — there is no
+  separate alpha or rc channel.
+- An appcast item that should be a beta but is missing the channel tag is
+  offered to every user (this happened with 1.9.2-beta.1 on 2026-07-30).
